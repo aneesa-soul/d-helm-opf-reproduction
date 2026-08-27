@@ -483,3 +483,307 @@ def validate_series(
             "Zeroth-order slack voltage does not match "
             "the specified reference voltage."
         )
+
+def build_RU_vectors(
+    problem: HelmProblem,
+    voltage_coefficients: np.ndarray,
+    inverse_voltage_coefficients: np.ndarray,
+    order: int,
+    active_power: np.ndarray,
+    reactive_power_coefficients: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Construct R_n and U_n according to Eq. (13) of the D-HELM paper.
+
+    Parameters
+    ----------
+    problem:
+        HELM problem containing bus classifications and voltage
+        setpoints.
+
+    voltage_coefficients:
+        Voltage power-series coefficients V[n, i].
+
+        Shape:
+            (order + 1, n_bus)
+
+    inverse_voltage_coefficients:
+        Inverse/conjugate-voltage series coefficients W[n, i].
+
+        Shape:
+            (order + 1, n_bus)
+
+    order:
+        Current HELM coefficient order n.
+
+        Must satisfy:
+            order >= 1
+
+    active_power:
+        Specified active-power vector P_i.
+
+        Shape:
+            (n_bus,)
+
+    reactive_power_coefficients:
+        Reactive-power series coefficients Q[n, i].
+
+        Shape:
+            (order + 1, n_bus)
+
+        Row 0 is unused and should normally be zero.
+
+    Returns
+    -------
+    R_n:
+        Complex vector of length n_bus.
+
+    U_n:
+        Real-valued vector containing one entry for every PV bus.
+
+    Notes
+    -----
+    This implements Eq. (13):
+
+        PQ:
+            R_i,n = e_i* W_i,n-1*
+
+        PV:
+            R_i,n =
+                P_i W_i,n-1*
+                - j sum_{m=1}^{n-1}
+                    Q_i,m W_i,n-m*
+
+        Slack:
+            R_i,1 = |v_i|^sp - 1
+            R_i,n = 0, n > 1
+
+        PV voltage equation:
+
+            U_i,1 =
+                (|v_i^sp|^2 - 1) / 2
+
+            U_i,n =
+                -1/2 sum_{m=1}^{n-1}
+                    V_i,m* V_i,n-m
+    """
+
+    # ------------------------------------------------------------
+    # Basic validation
+    # ------------------------------------------------------------
+
+    if order < 1:
+        raise ValueError(
+            "HELM coefficient order must be >= 1."
+        )
+
+    n_bus = problem.ybus.shape[0]
+
+    voltage_coefficients = np.asarray(
+        voltage_coefficients,
+        dtype=np.complex128,
+    )
+
+    inverse_voltage_coefficients = np.asarray(
+        inverse_voltage_coefficients,
+        dtype=np.complex128,
+    )
+
+    active_power = np.asarray(
+        active_power,
+        dtype=float,
+    )
+
+    reactive_power_coefficients = np.asarray(
+        reactive_power_coefficients,
+        dtype=float,
+    )
+
+    expected_shape = (order + 1, n_bus)
+
+    if voltage_coefficients.shape != expected_shape:
+        raise ValueError(
+            "voltage_coefficients must have shape "
+            f"{expected_shape}, got "
+            f"{voltage_coefficients.shape}."
+        )
+
+    if inverse_voltage_coefficients.shape != expected_shape:
+        raise ValueError(
+            "inverse_voltage_coefficients must have shape "
+            f"{expected_shape}, got "
+            f"{inverse_voltage_coefficients.shape}."
+        )
+
+    if reactive_power_coefficients.shape != expected_shape:
+        raise ValueError(
+            "reactive_power_coefficients must have shape "
+            f"{expected_shape}, got "
+            f"{reactive_power_coefficients.shape}."
+        )
+
+    if active_power.shape != (n_bus,):
+        raise ValueError(
+            f"active_power must have shape ({n_bus},)."
+        )
+
+    # ------------------------------------------------------------
+    # Allocate Eq. (13) vectors
+    # ------------------------------------------------------------
+
+    R_n = np.zeros(
+        n_bus,
+        dtype=np.complex128,
+    )
+
+    U_n = np.zeros(
+        len(problem.pv_buses),
+        dtype=float,
+    )
+
+    # ------------------------------------------------------------
+    # PQ buses
+    #
+    # R_i,n = e_i* W_i,n-1*
+    # ------------------------------------------------------------
+
+    for bus in problem.pq_buses:
+
+        e_spec = problem.s_spec[bus]
+
+        R_n[bus] = (
+            np.conjugate(e_spec)
+            * np.conjugate(
+                inverse_voltage_coefficients[order - 1, bus]
+            )
+        )
+
+    # ------------------------------------------------------------
+    # PV buses
+    #
+    # R_i,n =
+    #     P_i W_i,n-1*
+    #     - j sum(Q_i,m W_i,n-m*)
+    # ------------------------------------------------------------
+
+    for bus in problem.pv_buses:
+
+        # First term:
+        #
+        # P_i W_i,n-1*
+        #
+        r_value = (
+            active_power[bus]
+            * np.conjugate(
+                inverse_voltage_coefficients[
+                    order - 1,
+                    bus,
+                ]
+            )
+        )
+
+        # Second term:
+        #
+        # -j sum_{m=1}^{n-1}
+        #       Q_i,m W_i,n-m*
+        #
+        if order > 1:
+
+            q_sum = 0.0 + 0.0j
+
+            for m in range(1, order):
+
+                q_m = reactive_power_coefficients[
+                    m,
+                    bus,
+                ]
+
+                w_term = np.conjugate(
+                    inverse_voltage_coefficients[
+                        order - m,
+                        bus,
+                    ]
+                )
+
+                q_sum += q_m * w_term
+
+            r_value -= 1j * q_sum
+
+        R_n[bus] = r_value
+
+    # ------------------------------------------------------------
+    # Slack bus
+    #
+    # R_i,1 = |v_i^sp| - 1
+    #
+    # R_i,n = 0, n > 1
+    # ------------------------------------------------------------
+
+    slack = problem.slack_bus
+
+    if order == 1:
+
+        R_n[slack] = (
+            abs(problem.v_slack) - 1.0
+        )
+
+    else:
+
+        R_n[slack] = 0.0
+
+    # ------------------------------------------------------------
+    # U_n for PV buses
+    #
+    # n = 1:
+    #
+    # U_i,1 =
+    #     (|v_i^sp|^2 - 1) / 2
+    #
+    # n > 1:
+    #
+    # U_i,n =
+    #     -1/2 sum V_i,m* V_i,n-m
+    # ------------------------------------------------------------
+
+    for pv_position, bus in enumerate(problem.pv_buses):
+
+        if order == 1:
+
+            voltage_setpoint = (
+                problem.voltage_setpoints[bus]
+            )
+
+            U_n[pv_position] = (
+                voltage_setpoint**2 - 1.0
+            ) / 2.0
+
+        else:
+
+            u_sum = 0.0 + 0.0j
+
+            for m in range(1, order):
+
+                v_m = np.conjugate(
+                    voltage_coefficients[
+                        m,
+                        bus,
+                    ]
+                )
+
+                v_n_minus_m = (
+                    voltage_coefficients[
+                        order - m,
+                        bus,
+                    ]
+                )
+
+                u_sum += (
+                    v_m
+                    * v_n_minus_m
+                )
+
+            U_n[pv_position] = (
+                -0.5 * u_sum.real
+            )
+
+    return R_n, U_n
