@@ -787,3 +787,304 @@ def build_RU_vectors(
             )
 
     return R_n, U_n
+
+def solve_coefficient_order(
+    problem: HelmProblem,
+    voltage_coefficients: np.ndarray,
+    inverse_voltage_coefficients: np.ndarray,
+    order: int,
+    active_power: np.ndarray,
+    reactive_power_coefficients: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Solve the HELM coefficient system for order n.
+
+    This implements the linear solve associated with
+    Eqs. (12) and (13) of the D-HELM formulation.
+
+    The system solved is
+
+        A x_n = b_n
+
+    where
+
+        x_n =
+            [ Re(V_n)
+              Im(V_n)
+              Q_n ]
+
+    and
+
+        b_n =
+            [ Re(R_n)
+              Im(R_n)
+              U_n ].
+
+    Returns
+    -------
+    voltage_n:
+        Complex voltage coefficient V_n.
+
+    reactive_n:
+        Reactive-power coefficient Q_n for PV buses.
+    """
+
+    if order < 1:
+        raise ValueError(
+            "HELM coefficient order must be >= 1."
+        )
+
+    n_bus = problem.ybus.shape[0]
+    n_pv = len(problem.pv_buses)
+
+    # ------------------------------------------------------------
+    # Eq. (12): constant coefficient matrix
+    # ------------------------------------------------------------
+
+    A = build_coefficient_matrix(problem)
+
+    # ------------------------------------------------------------
+    # Eq. (13): construct R_n and U_n
+    # ------------------------------------------------------------
+
+    R_n, U_n = build_RU_vectors(
+        problem=problem,
+        voltage_coefficients=voltage_coefficients,
+        inverse_voltage_coefficients=inverse_voltage_coefficients,
+        order=order,
+        active_power=active_power,
+        reactive_power_coefficients=reactive_power_coefficients,
+    )
+
+    # ------------------------------------------------------------
+    # Construct the RHS of Eq. (12)
+    #
+    # [ Re(R_n) ]
+    # [ Im(R_n) ]
+    # [   U_n   ]
+    # ------------------------------------------------------------
+
+    rhs = np.concatenate(
+        [
+            R_n.real,
+            R_n.imag,
+            U_n,
+        ]
+    )
+
+    expected_size = 2 * n_bus + n_pv
+
+    if A.shape != (expected_size, expected_size):
+        raise ValueError(
+            "Coefficient matrix has unexpected shape: "
+            f"{A.shape}, expected "
+            f"({expected_size}, {expected_size})."
+        )
+
+    if rhs.shape != (expected_size,):
+        raise ValueError(
+            "Coefficient RHS has unexpected shape: "
+            f"{rhs.shape}, expected "
+            f"({expected_size},)."
+        )
+
+    # ------------------------------------------------------------
+    # Solve Eq. (12)
+    # ------------------------------------------------------------
+
+    solution = np.linalg.solve(A, rhs)
+
+    # ------------------------------------------------------------
+    # Extract V_n
+    #
+    # First n_bus entries:
+    #     Re(V_n)
+    #
+    # Next n_bus entries:
+    #     Im(V_n)
+    # ------------------------------------------------------------
+
+    voltage_n = (
+        solution[:n_bus]
+        + 1j * solution[n_bus:2 * n_bus]
+    )
+
+    # ------------------------------------------------------------
+    # Extract Q_n
+    #
+    # Last n_pv entries correspond to PV buses.
+    # ------------------------------------------------------------
+
+    reactive_n = solution[
+        2 * n_bus:
+    ]
+
+    return voltage_n, reactive_n
+
+def solve_helm_coefficient(
+    problem: HelmProblem,
+    coefficient_matrix: np.ndarray,
+    voltage_coefficients: np.ndarray,
+    inverse_voltage_coefficients: np.ndarray,
+    order: int,
+    active_power: np.ndarray,
+    reactive_power_coefficients: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Solve the HELM linear system for one coefficient order.
+
+    Implements the coefficient solve
+
+        A x_n =
+            [ Re(R_n) ]
+            [ Im(R_n) ]
+            [    U_n  ]
+
+    where
+
+        x_n =
+            [ Re(V_n) ]
+            [ Im(V_n) ]
+            [    Q_n  ]
+
+    Eq. (12) provides A and Eq. (13) provides R_n and U_n.
+
+    Parameters
+    ----------
+    problem:
+        HELM problem definition.
+
+    coefficient_matrix:
+        Constant coefficient matrix A from Eq. (12).
+
+    voltage_coefficients:
+        Voltage series coefficients calculated up to the
+        current order.
+
+    inverse_voltage_coefficients:
+        Inverse-voltage series coefficients calculated up to
+        the current order.
+
+    order:
+        Coefficient order n being solved.
+
+    active_power:
+        Specified active-power vector.
+
+    reactive_power_coefficients:
+        Reactive-power coefficient matrix.
+
+    Returns
+    -------
+    voltage_n:
+        Complex voltage coefficient V_n.
+
+    reactive_power_n:
+        Reactive-power coefficient Q_n for the PV buses.
+    """
+
+    if order < 1:
+        raise ValueError(
+            "HELM coefficient order must be >= 1."
+        )
+
+    n_bus = problem.ybus.shape[0]
+    n_pv = len(problem.pv_buses)
+
+    expected_size = 2 * n_bus + n_pv
+
+    coefficient_matrix = np.asarray(
+        coefficient_matrix,
+        dtype=float,
+    )
+
+    if coefficient_matrix.shape != (
+        expected_size,
+        expected_size,
+    ):
+        raise ValueError(
+            "Coefficient matrix must have shape "
+            f"({expected_size}, {expected_size}), "
+            f"got {coefficient_matrix.shape}."
+        )
+
+    # ------------------------------------------------------------
+    # Eq. (13)
+    # ------------------------------------------------------------
+
+    R_n, U_n = build_RU_vectors(
+        problem=problem,
+        voltage_coefficients=voltage_coefficients,
+        inverse_voltage_coefficients=inverse_voltage_coefficients,
+        order=order,
+        active_power=active_power,
+        reactive_power_coefficients=reactive_power_coefficients,
+    )
+
+    # ------------------------------------------------------------
+    # Construct RHS of Eq. (12)
+    #
+    #       [ Re(R_n) ]
+    # b_n = [ Im(R_n) ]
+    #       [   U_n   ]
+    # ------------------------------------------------------------
+
+    rhs = np.concatenate(
+        [
+            R_n.real,
+            R_n.imag,
+            U_n,
+        ]
+    )
+
+    # ------------------------------------------------------------
+    # Solve
+    #
+    # A x_n = b_n
+    # ------------------------------------------------------------
+
+    print("\n" + "=" * 60)
+    print("HELM LINEAR SYSTEM DIAGNOSTIC")
+    print("=" * 60)
+
+    print("order:", order)
+    print("matrix shape:", coefficient_matrix.shape)
+    print("matrix rank:", np.linalg.matrix_rank(coefficient_matrix))
+    print("matrix condition number:", np.linalg.cond(coefficient_matrix))
+    print("matrix determinant:", np.linalg.det(coefficient_matrix))
+
+    print("\nRHS:")
+    print(rhs)
+
+    print("\nCoefficient matrix:")
+    print(coefficient_matrix)
+    
+    x_n = np.linalg.solve(
+        coefficient_matrix,
+        rhs,
+    )
+
+    # ------------------------------------------------------------
+    # Extract V_n
+    #
+    # x_n =
+    #
+    # [ Re(V_n) ]
+    # [ Im(V_n) ]
+    # [   Q_n   ]
+    # ------------------------------------------------------------
+
+    voltage_n = (
+        x_n[:n_bus]
+        + 1j * x_n[n_bus:2 * n_bus]
+    )
+
+    # ------------------------------------------------------------
+    # Extract Q_n
+    # ------------------------------------------------------------
+
+    reactive_power_n = (
+        x_n[2 * n_bus:]
+    )
+
+    return voltage_n, reactive_power_n

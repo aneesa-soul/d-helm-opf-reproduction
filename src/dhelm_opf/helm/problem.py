@@ -175,43 +175,41 @@ def get_voltage_setpoints(
 
 def build_sbus(net: pp.pandapowerNet) -> np.ndarray:
     """
-    Construct the specified complex bus injection vector directly
-    from the network operating point.
+    Construct the specified complex bus-power vector for HELM.
 
-    Positive values represent net generation/injection.
-    Negative values represent net demand.
+    All power quantities are converted from pandapower's MW/MVAr
+    representation into per-unit using the network base power.
 
-    S_bus = (P_gen - P_load) + j(Q_gen - Q_load)
+    Positive values represent net active-power injection.
+    Negative values represent net active-power demand.
 
-    This function intentionally does NOT use net.res_bus because
-    HELM must calculate the power-flow solution independently.
+    For HELM:
+        - PQ-bus P and Q are specified.
+        - PV-bus P is specified, while Q is solved recursively.
+        - Slack-bus P and Q are not specified because its voltage
+          is fixed.
     """
 
     n_bus = len(net.bus)
+
+    if net.sn_mva <= 0:
+        raise ValueError(
+            "Network base power sn_mva must be positive."
+        )
+
+    base_mva = float(net.sn_mva)
 
     p = np.zeros(n_bus, dtype=float)
     q = np.zeros(n_bus, dtype=float)
 
     # ------------------------------------------------------------
-    # Conventional generators
+    # Generator active power
     # ------------------------------------------------------------
     if len(net.gen) > 0:
         for _, row in net.gen.iterrows():
             if bool(row["in_service"]):
                 bus = int(row["bus"])
-                p[bus] += float(row["p_mw"])
-
-                # Generator Q is not necessarily specified before
-                # an AC power flow. For now, use q_mvar if available.
-                if "q_mvar" in row.index and np.isfinite(row["q_mvar"]):
-                    q[bus] += float(row["q_mvar"])
-
-    # ------------------------------------------------------------
-    # External grid / slack generation
-    #
-    # For the HELM formulation the slack bus voltage is fixed,
-    # so we do not need to prescribe its active/reactive power.
-    # ------------------------------------------------------------
+                p[bus] += float(row["p_mw"]) / base_mva
 
     # ------------------------------------------------------------
     # Loads
@@ -220,8 +218,21 @@ def build_sbus(net: pp.pandapowerNet) -> np.ndarray:
         for _, row in net.load.iterrows():
             if bool(row["in_service"]):
                 bus = int(row["bus"])
-                p[bus] -= float(row["p_mw"])
-                q[bus] -= float(row["q_mvar"])
+
+                p[bus] -= float(row["p_mw"]) / base_mva
+                q[bus] -= float(row["q_mvar"]) / base_mva
+
+    # ------------------------------------------------------------
+    # Important:
+    #
+    # Do NOT add generator Q here.
+    #
+    # For PV buses, reactive power is an unknown HELM coefficient
+    # and is solved through Eq. (12)-(13) of the paper.
+    #
+    # Therefore q currently represents the specified PQ-bus
+    # reactive injection only.
+    # ------------------------------------------------------------
 
     return p + 1j * q
 
