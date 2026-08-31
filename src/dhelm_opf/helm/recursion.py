@@ -1088,3 +1088,67 @@ def solve_helm_coefficient(
     )
 
     return voltage_n, reactive_power_n
+
+def compute_bus_injections(
+    problem: HelmProblem,
+    voltage: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute complex bus power injections from the solved
+    HELM voltage vector.
+
+    Implements the physical power-injection calculation used
+    in Algorithm 1 of the D-HELM paper:
+
+        e_i = V_i * sum_j conj(Y_ij) * conj(V_j)
+
+    Parameters
+    ----------
+    problem:
+        HELM problem containing the full network admittance matrix.
+
+    voltage:
+        Complex bus-voltage vector evaluated at s = 1.
+
+    Returns
+    -------
+    np.ndarray
+        Complex bus-injection vector e.
+
+        Real part  = active-power injection P
+        Imaginary part = reactive-power injection Q
+    """
+
+    ybus = np.asarray(
+        problem.ybus,
+        dtype=np.complex128,
+    )
+
+    voltage = np.asarray(
+        voltage,
+        dtype=np.complex128,
+    )
+
+    n_bus = ybus.shape[0]
+
+    if voltage.shape != (n_bus,):
+        raise ValueError(
+            f"voltage must have shape ({n_bus},), "
+            f"got {voltage.shape}."
+        )
+
+    injections = np.zeros(
+        n_bus,
+        dtype=np.complex128,
+    )
+
+    for i in range(n_bus):
+        injections[i] = (
+            voltage[i]
+            * np.sum(
+                np.conjugate(ybus[i, :])
+                * np.conjugate(voltage)
+            )
+        )
+
+    return injections
