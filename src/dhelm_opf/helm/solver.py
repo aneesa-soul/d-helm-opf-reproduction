@@ -1,13 +1,11 @@
 """
-D-HELM solver for the IEEE 5-bus OPF reproduction.
+Top-level HELM solver for the IEEE 5-bus OPF reproduction.
 
-This module combines the HELM problem representation and coefficient
-recursion into a numerical solver.
+This module provides the public solver interface.
 
-Important:
-    This is the first physics-solver implementation. It is intended
-    to validate the HELM formulation against a conventional AC
-    power-flow solution before integrating the solver with DRL.
+The mathematical coefficient recursion is implemented in
+recursion.py. This module calls that recursion and packages
+the result into a structured HelmSolution object.
 """
 
 from __future__ import annotations
@@ -17,11 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .problem import HelmProblem
-from .recursion import (
-    initialize_voltage_series,
-    enforce_slack_coefficient,
-    validate_series,
-)
+from .recursion import solve_helm_series
 
 
 @dataclass(frozen=True)
@@ -29,7 +23,8 @@ class HelmSolverConfig:
     """Numerical settings for the HELM coefficient calculation."""
 
     max_order: int = 20
-    tolerance: float = 1e-10
+    tolerance: float = 1e-8
+    min_order: int = 3
 
 
 @dataclass
@@ -37,10 +32,21 @@ class HelmSolution:
     """Result returned by the HELM solver."""
 
     coefficients: np.ndarray
+    inverse_coefficients: np.ndarray
+    reactive_power_coefficients: np.ndarray
+
     voltage: np.ndarray
+    voltage_magnitude: np.ndarray
+    voltage_angle: np.ndarray
+
+    active_power: np.ndarray
+    reactive_power: np.ndarray
+
     converged: bool
     order: int
     residual: float
+
+    convergence_history: np.ndarray
 
 
 def evaluate_voltage_series(
@@ -50,14 +56,26 @@ def evaluate_voltage_series(
     """
     Evaluate the voltage power series at embedding parameter z.
 
-    If
+    V(z) = V(0) + V(1)z + V(2)z² + ...
 
-        V(z) = V[0] + V[1]z + V[2]z^2 + ...
+    Parameters
+    ----------
+    coefficients:
+        Array with shape (order + 1, n_bus).
 
-    then this function evaluates that series at the requested z.
+    z:
+        Embedding parameter.
+
+    Returns
+    -------
+    np.ndarray
+        Complex bus-voltage vector.
     """
 
-    coefficients = np.asarray(coefficients, dtype=complex)
+    coefficients = np.asarray(
+        coefficients,
+        dtype=complex,
+    )
 
     if coefficients.ndim != 2:
         raise ValueError(
@@ -81,32 +99,91 @@ def power_flow_residual(
     voltage: np.ndarray,
 ) -> float:
     """
-    Calculate the maximum complex power mismatch.
+    Calculate the maximum specified power mismatch.
 
-    S = V * conjugate(YV)
+    PQ buses:
+        P and Q are checked.
 
-    The residual measures the difference between the specified
-    injections and the injections produced by the calculated voltage.
+    PV buses:
+        P is checked.
+        Q is solved by HELM and is therefore not treated
+        as a specified quantity.
+
+    Slack bus:
+        Power mismatch is not included.
+
+    Returns
+    -------
+    float
+        Maximum absolute specified-power mismatch in p.u.
     """
 
-    voltage = np.asarray(voltage, dtype=complex)
+    voltage = np.asarray(
+        voltage,
+        dtype=complex,
+    )
 
-    if voltage.shape != (problem.ybus.shape[0],):
+    n_bus = problem.ybus.shape[0]
+
+    if voltage.shape != (n_bus,):
         raise ValueError(
             "Voltage vector has an incompatible shape."
         )
 
-    calculated_power = voltage * np.conjugate(
-        problem.ybus @ voltage
+    # Calculate actual complex injections:
+    #
+    # S = V * conj(YV)
+    calculated_power = (
+        voltage
+        * np.conjugate(problem.ybus @ voltage)
     )
 
-    mismatch = calculated_power - problem.s_spec
+    specified = problem.s_spec
 
-    # The slack bus is not part of the specified PQ balance.
-    mismatch = mismatch.copy()
-    mismatch[problem.slack_bus] = 0.0
+    mismatches = []
 
-    return float(np.max(np.abs(mismatch)))
+    pv_buses = set(problem.pv_buses)
+    slack = problem.slack_bus
+
+    for bus in range(n_bus):
+
+        if bus == slack:
+            continue
+
+        # -----------------------------------------------------
+        # PQ bus: P and Q are specified.
+        # -----------------------------------------------------
+        if bus not in pv_buses:
+
+            p_error = (
+                calculated_power[bus].real
+                - specified[bus].real
+            )
+
+            q_error = (
+                calculated_power[bus].imag
+                - specified[bus].imag
+            )
+
+            mismatches.append(abs(p_error))
+            mismatches.append(abs(q_error))
+
+        # -----------------------------------------------------
+        # PV bus: only P is specified.
+        # -----------------------------------------------------
+        else:
+
+            p_error = (
+                calculated_power[bus].real
+                - specified[bus].real
+            )
+
+            mismatches.append(abs(p_error))
+
+    if not mismatches:
+        return 0.0
+
+    return float(np.max(mismatches))
 
 
 def solve_helm(
@@ -114,63 +191,92 @@ def solve_helm(
     config: HelmSolverConfig | None = None,
 ) -> HelmSolution:
     """
-    Solve the HELM problem.
+    Solve the HELM embedded power-flow problem.
 
-    The current implementation establishes the solver interface and
-    performs the initial coefficient construction. The coefficient
-    recursion itself is delegated to recursion.py.
-
-    Parameters
-    ----------
-    problem:
-        HELM problem containing Ybus, Sbus, slack voltage and slack bus.
-
-    config:
-        Numerical solver configuration.
-
-    Returns
-    -------
-    HelmSolution
-        Voltage-series coefficients and evaluated voltage.
+    The coefficient recursion is delegated to
+    recursion.solve_helm_series().
     """
 
     if config is None:
         config = HelmSolverConfig()
 
     if config.max_order < 1:
-        raise ValueError("max_order must be at least 1.")
+        raise ValueError(
+            "max_order must be at least 1."
+        )
 
-    coefficients = initialize_voltage_series(
-        problem,
-        config.max_order,
+    if config.min_order < 1:
+        raise ValueError(
+            "min_order must be at least 1."
+        )
+
+    if config.min_order > config.max_order:
+        raise ValueError(
+            "min_order cannot exceed max_order."
+        )
+
+    # ---------------------------------------------------------
+    # Run complete HELM coefficient recursion.
+    # ---------------------------------------------------------
+
+    result = solve_helm_series(
+        problem=problem,
+        max_order=config.max_order,
+        tol=config.tolerance,
+        min_order=config.min_order,
     )
 
-    enforce_slack_coefficient(
-        coefficients,
-        problem,
-    )
+    voltage = result["voltage"]
 
-    validate_series(
-        coefficients,
-        problem,
-    )
-
-    voltage = evaluate_voltage_series(
-        coefficients,
-        z=1.0,
-    )
+    # ---------------------------------------------------------
+    # Independently evaluate specified-power residual.
+    # ---------------------------------------------------------
 
     residual = power_flow_residual(
         problem,
         voltage,
     )
 
-    converged = residual <= config.tolerance
+    converged = (
+        result["converged"]
+        and residual <= config.tolerance
+    )
+
+    # ---------------------------------------------------------
+    # Package result.
+    # ---------------------------------------------------------
 
     return HelmSolution(
-        coefficients=coefficients,
-        voltage=voltage,
+        coefficients=result[
+            "voltage_coefficients"
+        ],
+        inverse_coefficients=result[
+            "inverse_voltage_coefficients"
+        ],
+        reactive_power_coefficients=result[
+            "reactive_power_coefficients"
+        ],
+
+        voltage=result["voltage"],
+        voltage_magnitude=result[
+            "voltage_magnitude"
+        ],
+        voltage_angle=result[
+            "voltage_angle"
+        ],
+
+        active_power=result[
+            "active_power"
+        ],
+        reactive_power=result[
+            "reactive_power"
+        ],
+
         converged=converged,
-        order=config.max_order,
+        order=result["orders_used"],
         residual=residual,
+
+        convergence_history=result[
+            "convergence_history"
+        ],
     )
