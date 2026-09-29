@@ -211,6 +211,22 @@ def build_sbus(net: pp.pandapowerNet) -> np.ndarray:
                 bus = int(row["bus"])
                 p[bus] += float(row["p_mw"]) / base_mva
 
+
+    if len(net.sgen) > 0:
+        for _, row in net.sgen.iterrows():
+            if bool(row["in_service"]):
+                bus = int(row["bus"])
+                p[bus] += (
+                    float(row["p_mw"])
+                    * float(row.get("scaling", 1.0))
+                    / base_mva
+                )
+                q[bus] += (
+                    float(row["q_mvar"])
+                    * float(row.get("scaling", 1.0))
+                    / base_mva
+                )
+
     # ------------------------------------------------------------
     # Loads
     # ------------------------------------------------------------
@@ -304,8 +320,8 @@ def inspect_helm_problem(problem: HelmProblem) -> None:
     for bus, value in enumerate(problem.s_spec):
         print(
             f"  bus {bus}: "
-            f"P={value.real:.6f} MW, "
-            f"Q={value.imag:.6f} MVAr"
+            f"P={value.real:.6f} p.u., "
+            f"Q={value.imag:.6f} p.u."
         )
 
 
