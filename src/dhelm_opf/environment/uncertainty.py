@@ -53,7 +53,13 @@ class UncertaintyConfig:
 
     # The paper specifies two wind buses for the 5-bus system.
     # Their exact indices are supplied externally rather than guessed.
-    wind_buses: tuple[int, ...] = ()
+    
+    # Replication assumption:
+    # The paper specifies two wind buses, but their exact placement
+    # is not available in the publicly accessible material.
+    wind_buses: tuple[int, ...] = (1, 4)
+    # Replication assumption: 100 MW rated wind capacity at each bus.
+    wind_rated_mw: tuple[float, ...] = (100.0, 100.0)
 
 
 @dataclass(frozen=True)
@@ -238,12 +244,32 @@ def apply_wind_output(
 
         output_mw = float(scale * rated)
 
-        # Wind units will be represented explicitly as generators
-        # when the exact companion-system configuration is available.
-        #
-        # We intentionally do not mutate net.gen here because doing so
-        # without knowing which generators are wind resources could
-        # silently corrupt the paper's test system.
+        # Represent wind explicitly as a static generator (sgen).
+        # This keeps wind generation separate from the conventional
+        # controllable generators in net.gen.
+
+        existing = net.sgen.index[
+            net.sgen["bus"] == bus
+        ].tolist()
+
+        if existing:
+            idx = existing[0]
+
+            net.sgen.at[idx, "p_mw"] = output_mw
+            net.sgen.at[idx, "q_mvar"] = 0.0
+            net.sgen.at[idx, "scaling"] = 1.0
+            net.sgen.at[idx, "in_service"] = True
+
+        else:
+            pp.create_sgen(
+                net,
+                bus=bus,
+                p_mw=output_mw,
+                q_mvar=0.0,
+                scaling=1.0,
+                in_service=True,
+                name=f"wind_bus_{bus}",
+            )
 
         print(
             f"Wind bus {bus}: "
@@ -294,20 +320,39 @@ if __name__ == "__main__":
 
     net = build_case5()
 
-    # Intentionally left empty until the exact two wind-bus
-    # indices from the electronic companion are identified.
     config = UncertaintyConfig(
-        wind_buses=(),
+        wind_buses=(1, 4),
+        wind_rated_mw=(100.0, 100.0),
     )
 
-    try:
-        validate_uncertainty_config(net, config)
-    except ValueError as exc:
-        print("Configuration check:")
-        print(exc)
-        print()
-        print(
-            "This is intentional: the paper specifies two wind buses "
-            "but refers to the electronic companion for their exact "
-            "placement."
-        )
+    validate_uncertainty_config(net, config)
+
+    rng = np.random.default_rng(42)
+
+    scenario = sample_scenario(
+        config=config,
+        rng=rng,
+    )
+
+    apply_demand_uncertainty(
+        net,
+        scenario,
+    )
+
+    apply_wind_output(
+        net=net,
+        wind_buses=config.wind_buses,
+        wind_scale=scenario.wind_scale,
+        wind_rated_mw=config.wind_rated_mw,
+    )
+
+    state = scenario_to_state(
+        net,
+        scenario,
+    )
+
+    print("\nUncertainty state:")
+    print(state)
+
+    print("\nWind generators:")
+    print(net.sgen[["bus", "p_mw", "q_mvar", "in_service"]])
