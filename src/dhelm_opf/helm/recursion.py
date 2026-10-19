@@ -23,7 +23,15 @@ def initialize_voltage_series(
 
     V(s) = V[0] + V[1]s + V[2]s^2 + ...
 
-    The zeroth-order voltage is initialized from the slack voltage.
+    The zeroth-order term is the paper's no-load germ:
+
+        V[i, 0] = 1  for every bus i   (W[i, 0] = 1, Q[i, 0] = 0)
+
+    It is NOT the slack voltage.  The specified slack voltage enters
+    through the slack row of R_n at n = 1 (V_slack,1 = v_slack - 1),
+    so that V_slack(s) = 1 + s (v_slack - 1) and V_slack(1) = v_slack.
+    Every other part of the recursion (W[0] = 1, the PV equation
+    U_1 = (|v_sp|^2 - 1) / 2) also assumes V[0] = 1.
 
     Parameters
     ----------
@@ -51,7 +59,7 @@ def initialize_voltage_series(
         dtype=np.complex128,
     )
 
-    coefficients[0, :] = problem.v_slack
+    coefficients[0, :] = 1.0 + 0.0j
 
     return coefficients
 
@@ -336,24 +344,30 @@ def enforce_slack_coefficient(
     problem: HelmProblem,
 ) -> None:
     """
-    Enforce the fixed slack-bus voltage for every series coefficient.
+    Enforce the slack-bus voltage series implied by the paper's
+    embedding with the no-load germ:
 
-    For a fixed reference voltage:
-
-        V_slack(s) = V_slack
+        V_slack(s) = 1 + s (v_slack - 1)
 
     therefore:
 
-        V_slack[0] = V_slack
-        V_slack[k] = 0,  k > 0
+        V_slack[0] = 1
+        V_slack[1] = v_slack - 1
+        V_slack[k] = 0,  k > 1
+
+    The linear solve already produces these values through the slack
+    row of R_n; this function only removes round-off.
     """
 
     slack = problem.slack_bus
 
-    coefficients[0, slack] = problem.v_slack
+    coefficients[0, slack] = 1.0 + 0.0j
 
     if coefficients.shape[0] > 1:
-        coefficients[1:, slack] = 0.0
+        coefficients[1, slack] = problem.v_slack - 1.0
+
+    if coefficients.shape[0] > 2:
+        coefficients[2:, slack] = 0.0
 
 
 def validate_series(
@@ -380,13 +394,19 @@ def validate_series(
 
     slack = problem.slack_bus
 
-    if not np.isclose(
-        coefficients[0, slack],
+    if not np.allclose(coefficients[0, :], 1.0):
+        raise ValueError(
+            "Zeroth-order coefficients must equal the no-load "
+            "germ V[0] = 1 at every bus."
+        )
+
+    if coefficients.shape[0] > 1 and not np.isclose(
+        np.sum(coefficients[:, slack]),
         problem.v_slack,
     ):
         raise ValueError(
-            "Zeroth-order slack voltage does not match "
-            "the specified reference voltage."
+            "Slack voltage series does not sum to the "
+            "specified reference voltage."
         )
 
 def build_RU_vectors(
@@ -455,8 +475,11 @@ def build_RU_vectors(
         # -----------------------------------------------------
         if bus == slack:
 
+            # Paper: |v_sp| - 1 at n = 1.  Using the complex value
+            # is identical when the slack angle is 0 (the paper's
+            # reference) and stays correct for a non-zero angle.
             if order == 1:
-                R_n[bus] = abs(problem.v_slack) - 1.0
+                R_n[bus] = problem.v_slack - 1.0
             else:
                 R_n[bus] = 0.0
 
@@ -612,11 +635,57 @@ def solve_coefficient_order(
 
     return voltage_n, q_n
 
+def eq14_mismatch(
+    problem: HelmProblem,
+    voltage: np.ndarray,
+) -> float:
+    """
+    Largest mismatch of the paper's termination conditions (14a)-(14c).
+
+        (14a)  | |v_i| - |v_i^sp| |      for PV buses
+        (14b)  | e_i - e_i^sp |          for PQ buses (complex P + jQ)
+        (14c)  | Re(e_i) - Re(e_i^sp) |  for PV buses
+
+    where e_i = v_i * sum_j conj(Y_ij v_j) is evaluated with the full
+    Ybus at the partial-sum voltage V(1) = sum_n V_n.
+
+    The slack bus is excluded: its voltage is fixed by construction
+    and its P/Q are outputs of the critic, not specifications.
+    """
+
+    voltage = np.asarray(voltage, dtype=np.complex128)
+
+    injection = voltage * np.conjugate(problem.ybus @ voltage)
+
+    mismatches = [0.0]
+
+    for bus in problem.pq_buses:
+        mismatches.append(
+            abs(injection[bus] - problem.s_spec[bus])
+        )
+
+    for bus in problem.pv_buses:
+        mismatches.append(
+            abs(
+                abs(voltage[bus])
+                - problem.voltage_setpoints[bus]
+            )
+        )
+        mismatches.append(
+            abs(
+                injection[bus].real
+                - problem.s_spec[bus].real
+            )
+        )
+
+    return float(max(mismatches))
+
+
 def solve_helm_series(
     problem,
-    max_order=20,
-    tol=1e-8,
-    min_order=3,
+    max_order=30,
+    tol=1e-5,
+    min_order=1,
 ):
     """
     Solve the HELM embedded power-flow problem
@@ -628,11 +697,12 @@ def solve_helm_series(
         HELM problem definition.
 
     max_order : int
-        Maximum number of series coefficients.
+        Maximum number of series coefficients
+        (paper, Algorithm 1: n_max = 30).
 
     tol : float
-        Convergence tolerance based on successive
-        partial sums evaluated at s = 1.
+        Tolerance on the Eq. (14a)-(14c) mismatches at the
+        partial sum V(1) (paper, Algorithm 1: 1e-5).
 
     min_order : int
         Minimum number of orders before convergence
@@ -684,6 +754,7 @@ def solve_helm_series(
     )
 
     convergence_history = []
+    mismatch_history = []
 
     converged = False
     orders_used = 0
@@ -741,20 +812,26 @@ def solve_helm_series(
         )
 
         # -----------------------------------------------------
-        # Convergence measure.
+        # Convergence measures.
+        #
+        # increment : size of the newest term (diagnostic only)
+        # mismatch  : paper's termination test, Eq. (14a)-(14c)
         # -----------------------------------------------------
-        error = np.max(
+        increment = np.max(
             np.abs(V_current - V_previous)
         )
 
-        convergence_history.append(error)
+        mismatch = eq14_mismatch(problem, V_current)
+
+        convergence_history.append(increment)
+        mismatch_history.append(mismatch)
 
         orders_used = order
 
         # -----------------------------------------------------
-        # Check convergence.
+        # Algorithm 1, step 4: terminate when (14) holds.
         # -----------------------------------------------------
-        if order >= min_order and error < tol:
+        if order >= min_order and mismatch <= tol:
             converged = True
             break
 
@@ -825,6 +902,9 @@ def solve_helm_series(
         "orders_used": orders_used,
         "convergence_history": np.asarray(
             convergence_history
+        ),
+        "mismatch_history": np.asarray(
+            mismatch_history
         ),
     }
 

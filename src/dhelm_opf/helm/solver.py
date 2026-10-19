@@ -15,16 +15,21 @@ from dataclasses import dataclass
 import numpy as np
 
 from .problem import HelmProblem
-from .recursion import solve_helm_series
+from .recursion import eq14_mismatch, solve_helm_series
 
 
 @dataclass(frozen=True)
 class HelmSolverConfig:
-    """Numerical settings for the HELM coefficient calculation."""
+    """
+    Numerical settings for the HELM coefficient calculation.
 
-    max_order: int = 20
-    tolerance: float = 1e-8
-    min_order: int = 3
+    Defaults follow Algorithm 1 of the paper:
+        n_max = 30,  epsilon = varepsilon = 1e-5  (Eq. 14 mismatches)
+    """
+
+    max_order: int = 30
+    tolerance: float = 1e-5
+    min_order: int = 1
 
 
 @dataclass
@@ -99,23 +104,19 @@ def power_flow_residual(
     voltage: np.ndarray,
 ) -> float:
     """
-    Calculate the maximum specified power mismatch.
+    Maximum mismatch of the paper's termination conditions (14a)-(14c).
 
-    PQ buses:
-        P and Q are checked.
+    PQ buses : |e_i - e_i^sp|            (complex P + jQ)
+    PV buses : ||v_i| - |v_i^sp||  and  |P_i - P_i^sp|
+    Slack    : excluded
 
-    PV buses:
-        P is checked.
-        Q is solved by HELM and is therefore not treated
-        as a specified quantity.
-
-    Slack bus:
-        Power mismatch is not included.
+    This is the same test the recursion uses to stop, so the solver's
+    `converged` flag and `residual` can no longer disagree.
 
     Returns
     -------
     float
-        Maximum absolute specified-power mismatch in p.u.
+        Maximum mismatch (p.u.).
     """
 
     voltage = np.asarray(
@@ -130,60 +131,7 @@ def power_flow_residual(
             "Voltage vector has an incompatible shape."
         )
 
-    # Calculate actual complex injections:
-    #
-    # S = V * conj(YV)
-    calculated_power = (
-        voltage
-        * np.conjugate(problem.ybus @ voltage)
-    )
-
-    specified = problem.s_spec
-
-    mismatches = []
-
-    pv_buses = set(problem.pv_buses)
-    slack = problem.slack_bus
-
-    for bus in range(n_bus):
-
-        if bus == slack:
-            continue
-
-        # -----------------------------------------------------
-        # PQ bus: P and Q are specified.
-        # -----------------------------------------------------
-        if bus not in pv_buses:
-
-            p_error = (
-                calculated_power[bus].real
-                - specified[bus].real
-            )
-
-            q_error = (
-                calculated_power[bus].imag
-                - specified[bus].imag
-            )
-
-            mismatches.append(abs(p_error))
-            mismatches.append(abs(q_error))
-
-        # -----------------------------------------------------
-        # PV bus: only P is specified.
-        # -----------------------------------------------------
-        else:
-
-            p_error = (
-                calculated_power[bus].real
-                - specified[bus].real
-            )
-
-            mismatches.append(abs(p_error))
-
-    if not mismatches:
-        return 0.0
-
-    return float(np.max(mismatches))
+    return eq14_mismatch(problem, voltage)
 
 
 def solve_helm(
