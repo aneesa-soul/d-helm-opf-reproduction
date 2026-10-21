@@ -7,6 +7,11 @@ name = "dhelm-opf-reproduction"
 version = "0.1.0"
 description = "Independent reproduction of the D-HELM optimal power flow method"
 requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandapower>=2.13",
+    "torch>=2.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -45,7 +45,7 @@ A conventional AC power-flow calculation has also been successfully executed.
 
 ### 3. HELM physics infrastructure
 
-**Status: NumPy reference solver complete and validated. Differentiable (PyTorch) version not yet started.**
+**Status: NumPy reference solver and differentiable PyTorch D-HELM both complete and validated.**
 
 Implemented following the paper's equations:
 
@@ -60,7 +60,30 @@ Validation (`scripts/test_helm_random_vs_pandapower.py`): 200 random scenarios v
 * With a tight tolerance, the solver matches pandapower to 7×10⁻¹¹.
 * With the paper's tolerance, 200/200 scenarios converge using 4–6 terms, with a maximum voltage error of 9×10⁻⁷.
 
-This NumPy solver is the reference implementation. The differentiable D-HELM critic will be validated against it.
+This NumPy solver is the reference implementation. The differentiable D-HELM is validated against it.
+
+#### Differentiable D-HELM (`helm/differentiable.py`)
+
+The differentiable version follows Sec. 3.2.2 and Eq. (17) of the paper:
+
+* `DHelmNetwork` precomputes the constant network data once: Ybus, the Y^tr / Y^sh split, A with its LU factors, and the incidence matrices.
+* The linear assignment (state, normalized action) → (P, Q, |v|_sp) is differentiable, so gradients start from the policy output.
+* The batched recursion uses real arithmetic and needs one `lu_solve` per series order for the whole minibatch.
+* The Eq. (14) stopping test is applied outside the autograd graph. The loop stops once every sample in the batch has converged. The gradient is exactly that of the resulting N-term series.
+
+Reproduction choices:
+
+* float64 inside the solver.
+* The ∇U_n expression in the paper's appendix (A.13) shows only R(V)·R(V) terms, while Eq. (13) uses Re(V*V). Autograd differentiates Eq. (13) as written, and gradcheck verifies it.
+
+Validation (`scripts/test_dhelm_differentiable.py`):
+
+* Torch matches NumPy at the same number of terms to 2×10⁻¹⁶.
+* With adaptive stopping, the solution matches pandapower to 1.5×10⁻⁷.
+* 500/500 random samples over the full action range converge within n_max.
+* `torch.autograd.gradcheck` passes with respect to both action and state.
+* The autograd Jacobian of |v|, slack P and PV/slack Q with respect to the action matches pandapower finite differences to 7×10⁻¹¹ (relative).
+* Forward plus backward for a minibatch of 32 takes about 10 ms on CPU.
 
 ### 4. Operating-condition uncertainty
 
@@ -125,8 +148,7 @@ Validation: `scripts/test_action_config.py` and `scripts/test_action_decoder.py`
 
 The following components remain to be implemented and validated:
 
-* Differentiable (PyTorch, batched) D-HELM solver.
-* Physics-derived critic: Eqs. (15)–(16), violations (6), reward (5).
+* Physics-derived critic: Eqs. (15)–(16), violations (6), reward (5), built on the differentiable D-HELM.
 * Policy network.
 * Reinforcement-learning environment/interface.
 * Policy optimization algorithm.
@@ -170,5 +192,6 @@ The following are complete and validated:
 * The IEEE 5-bus network and the uncertainty-state representation.
 * The NumPy HELM reference solver, which matches pandapower.
 * The action space derived from the network.
+* The differentiable, batched PyTorch D-HELM, with its forward pass and gradients both verified.
 
-The next major implementation target is the differentiable D-HELM solver. It will be validated against the NumPy solver, along with a gradient check, before it is connected to the critic and the policy.
+The next implementation target is the critic outputs on top of D-HELM: slack P (15), the PQ-voltage, slack ramping, generator Q and line-current constraints (16), the violations (6) and the reward (5).

@@ -1,0 +1,3 @@
+numpy
+pandapower>=2.13
+torch>=2.0
