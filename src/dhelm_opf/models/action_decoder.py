@@ -1,142 +1,86 @@
 """
-Decode the normalized 8-dimensional policy action into physical OPF
-setpoints.
+Decode the normalized policy action into physical OPF setpoints.
 
 Paper basis
 -----------
-For the 5-bus case, Table 1 gives:
+Table 1: policy output = |B_v ∪ B_s| + |G / G_s|  (4 + 4 = 8 for 5-bus).
 
-    Policy output = |B_v ∪ B_s| + |G / G_s|
-                  = 4 + 4
-                  = 8
+The bounds are taken from the ActionConfig, which is derived from the
+network data (see action_config.action_config_from_network), so no
+limits are supplied or invented here.
 
-The policy therefore produces four voltage-related controls and four
-non-slack-generator active-power controls.
+Normalized action convention
+----------------------------
+Each policy output is in [-1, 1] and is mapped linearly to its physical
+range:
 
-The paper does not explicitly identify the individual buses/generators
-corresponding to those eight outputs. Therefore, this decoder does not
-silently assume generator identities or generator limits.
+    voltage   : [-1, 1] -> [V_min, V_max]   (p.u.)
+    generator : [-1, 1] -> [P_min, P_max]   (MW)
 
-The physical generator bounds must be supplied explicitly by the caller.
+The policy's tanh / bound enforcement will be connected later.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Sequence, Tuple
+from typing import Sequence
 
 import numpy as np
+import pandapower as pp
 
-from .action_config import ActionConfig, DEFAULT_ACTION_CONFIG
+from .action_config import ActionConfig
 
 
 @dataclass(frozen=True)
 class DecodedAction:
     """
-    Physical action passed toward the D-HELM physics model.
+    Physical setpoints for one policy action.
 
-    Attributes
-    ----------
-    voltage_setpoints:
-        Four voltage-magnitude setpoints in p.u.
-
-    generator_p_setpoints:
-        Four active-power setpoints in p.u.
+    voltage_setpoints[k]  belongs to config.voltage_buses[k]   (p.u.)
+    generator_p_mw[k]     belongs to config.generators[k]      (MW)
     """
 
-    voltage_setpoints: Tuple[float, ...]
-    generator_p_setpoints: Tuple[float, ...]
+    voltage_setpoints: np.ndarray
+    generator_p_mw: np.ndarray
+    base_mva: float
+
+    @property
+    def generator_p_pu(self) -> np.ndarray:
+        return self.generator_p_mw / self.base_mva
 
     @property
     def action_dim(self) -> int:
-        return len(self.voltage_setpoints) + len(
-            self.generator_p_setpoints
-        )
+        return len(self.voltage_setpoints) + len(self.generator_p_mw)
 
 
 class ActionDecoder:
-    """
-    Convert normalized policy outputs into physical OPF setpoints.
+    """Convert normalized policy outputs into physical OPF setpoints."""
 
-    Normalized action convention
-    ----------------------------
-    Each policy output is expected to be in [-1, 1].
-
-    Voltage controls:
-        [-1, 1] -> [V_min, V_max]
-
-    Generator controls:
-        [-1, 1] -> [P_min, P_max]
-
-    This linear scaling is an implementation representation of the
-    physical action bounds. The policy's tanh/bound-enforcement
-    mechanism will be connected later.
-    """
-
-    def __init__(
-        self,
-        config: ActionConfig = DEFAULT_ACTION_CONFIG,
-        generator_pmin: Sequence[float] | None = None,
-        generator_pmax: Sequence[float] | None = None,
-    ) -> None:
+    def __init__(self, config: ActionConfig) -> None:
 
         self.config = config
 
-        if generator_pmin is None or generator_pmax is None:
-            raise ValueError(
-                "generator_pmin and generator_pmax must be supplied "
-                "explicitly for all 4 generator controls. "
-                "Do not invent generator limits."
-            )
+        self._v_min = np.asarray(config.voltage_min, dtype=float)
+        self._v_max = np.asarray(config.voltage_max, dtype=float)
 
-        self.generator_pmin = tuple(
-            float(value) for value in generator_pmin
-        )
-        self.generator_pmax = tuple(
-            float(value) for value in generator_pmax
-        )
+        self._p_min = config.generator_p_min_mw
+        self._p_max = config.generator_p_max_mw
 
-        if len(self.generator_pmin) != 4:
-            raise ValueError(
-                "Exactly 4 generator Pmin values are required."
-            )
-
-        if len(self.generator_pmax) != 4:
-            raise ValueError(
-                "Exactly 4 generator Pmax values are required."
-            )
-
-        for pmin, pmax in zip(
-            self.generator_pmin,
-            self.generator_pmax,
-        ):
-            if pmin > pmax:
-                raise ValueError(
-                    f"Invalid generator bounds: "
-                    f"Pmin={pmin} > Pmax={pmax}"
-                )
-
-    @staticmethod
     def _validate_normalized_action(
+        self,
         action: Sequence[float],
     ) -> np.ndarray:
-        """Validate and convert the policy action."""
 
         values = np.asarray(action, dtype=float)
 
-        if values.ndim != 1:
+        if values.shape != (self.config.action_dim,):
             raise ValueError(
-                "Action must be a one-dimensional vector."
-            )
-
-        if values.shape[0] != 8:
-            raise ValueError(
-                f"Expected an 8-dimensional action, "
-                f"received shape {values.shape}."
+                f"Expected an action of shape ({self.config.action_dim},), "
+                f"received {values.shape}."
             )
 
         if not np.all(np.isfinite(values)):
-            raise ValueError(
-                "Action contains NaN or infinite values."
-            )
+            raise ValueError("Action contains NaN or infinite values.")
 
         if np.any(values < -1.0) or np.any(values > 1.0):
             raise ValueError(
@@ -146,59 +90,61 @@ class ActionDecoder:
         return values
 
     @staticmethod
-    def _scale(
-        value: float,
-        lower: float,
-        upper: float,
-    ) -> float:
-        """
-        Map [-1, 1] to [lower, upper].
-        """
+    def _scale(value, lower, upper):
+        """Map [-1, 1] to [lower, upper] (element-wise)."""
 
-        return lower + 0.5 * (value + 1.0) * (
-            upper - lower
-        )
+        return lower + 0.5 * (value + 1.0) * (upper - lower)
 
-    def decode(
-        self,
-        action: Sequence[float],
-    ) -> DecodedAction:
-        """
-        Decode an 8-dimensional normalized policy action.
-        """
+    def decode(self, action: Sequence[float]) -> DecodedAction:
 
         action = self._validate_normalized_action(action)
 
-        # --------------------------------------------------------------
-        # First four policy outputs -> voltage setpoints
-        # --------------------------------------------------------------
-
-        voltage_setpoints = tuple(
-            self._scale(
-                value=action[index],
-                lower=self.config.voltage_min,
-                upper=self.config.voltage_max,
-            )
-            for index in self.config.voltage_action_indices
-        )
-
-        # --------------------------------------------------------------
-        # Last four policy outputs -> generator P setpoints
-        # --------------------------------------------------------------
-
-        generator_setpoints = tuple(
-            self._scale(
-                value=action[index],
-                lower=self.generator_pmin[position],
-                upper=self.generator_pmax[position],
-            )
-            for position, index in enumerate(
-                self.config.generator_action_indices
-            )
-        )
+        v_part = action[list(self.config.voltage_action_indices)]
+        p_part = action[list(self.config.generator_action_indices)]
 
         return DecodedAction(
-            voltage_setpoints=voltage_setpoints,
-            generator_p_setpoints=generator_setpoints,
+            voltage_setpoints=self._scale(v_part, self._v_min, self._v_max),
+            generator_p_mw=self._scale(p_part, self._p_min, self._p_max),
+            base_mva=self.config.base_mva,
         )
 
+
+def apply_action_to_network(
+    net: pp.pandapowerNet,
+    config: ActionConfig,
+    decoded: DecodedAction,
+) -> None:
+    """
+    Write decoded setpoints into the pandapower network.
+
+    Voltage setpoints:
+        slack bus -> ext_grid.vm_pu
+        PV bus    -> vm_pu of every in-service gen on that bus
+
+    Generator setpoints:
+        p_mw of the corresponding gen / sgen row
+
+    Used for validation against pandapower and to build HelmProblem
+    instances.  The training critic will take these values directly as
+    tensors instead of going through pandapower.
+    """
+
+    for bus, vm in zip(config.voltage_buses, decoded.voltage_setpoints):
+
+        if bus == config.slack.bus:
+            net.ext_grid.at[config.slack.index, "vm_pu"] = float(vm)
+            continue
+
+        on_bus = net.gen.index[
+            (net.gen["bus"] == bus) & net.gen["in_service"]
+        ]
+
+        if len(on_bus) == 0:
+            raise ValueError(
+                f"No in-service gen regulates voltage bus {bus}."
+            )
+
+        net.gen.loc[on_bus, "vm_pu"] = float(vm)
+
+    for unit, p_mw in zip(config.generators, decoded.generator_p_mw):
+        net[unit.table].at[unit.index, "p_mw"] = float(p_mw)

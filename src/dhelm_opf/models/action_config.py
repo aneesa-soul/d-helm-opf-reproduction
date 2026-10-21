@@ -1,173 +1,344 @@
 """
-Action configuration for the 5-bus D-HELM OPF reproduction.
+Action configuration for the D-HELM OPF reproduction.
 
 Paper basis
 -----------
-For the 5-bus case, Table 1 defines the policy output dimension as:
+Table 1 defines the policy output dimension as
 
-    |B_v ∪ B_s| + |G / G_s| = 4 + 4 = 8
+    |B_v ∪ B_s| + |G / G_s|
 
-Therefore, the policy action contains:
-    - 4 voltage-related controls
-    - 4 active-power controls for non-slack generators
+i.e. one voltage setpoint per voltage-controlled bus (PV buses B_v and
+the slack bus B_s) plus one active-power setpoint per non-slack
+generator.
 
-Important reproduction note
+How the mapping is obtained
 ---------------------------
-The paper does not explicitly enumerate the individual bus/generator
-indices corresponding to these 4 + 4 controls.
+The mapping is DERIVED from the paper's Table 1 definition and the case
+data; it is not a free assumption.  `action_config_from_network()`
+reads it from the pandapower network:
 
-Therefore, the specific mapping below is an explicit reproduction
-assumption. It must not be interpreted as the author's exact mapping.
+    voltage buses : buses of in-service `gen` units  ∪  ext_grid bus
+    generators    : in-service `gen` units and controllable, non-wind
+                    `sgen` units (the slack unit is excluded)
+    limits        : bus min/max_vm_pu, unit min/max_p_mw, min/max_q_mvar
+    costs         : net.poly_cost
 
-The configuration is kept separate from the D-HELM critic so that the
-assumption can be changed later without modifying the physics model.
+For the IEEE 5-bus case this gives 4 + 4 = 8, matching Table 1:
+
+    voltage buses : (0, 2, 3, 4)            PV {0, 2, 4} + slack {3}
+    generators    : gen0@0, sgen0@0, gen1@2, gen2@4
+
+Wind units are tagged with sgen.type == WIND_SGEN_TYPE (see
+environment/uncertainty.py) and are never treated as controllable
+generators.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Tuple
+
+import numpy as np
+import pandapower as pp
+
+from dhelm_opf.environment.uncertainty import WIND_SGEN_TYPE
+
+
+@dataclass(frozen=True)
+class GeneratorUnit:
+    """
+    One controllable generating unit, identified by its pandapower table.
+
+    Power limits are in MW / MVAr.  Cost follows pandapower's poly_cost:
+
+        cost = cp0 + cp1 * p_mw + cp2 * p_mw**2
+    """
+
+    table: str          # "gen", "sgen" or "ext_grid"
+    index: int          # row index in that table
+    bus: int
+
+    p_min_mw: float
+    p_max_mw: float
+    q_min_mvar: float
+    q_max_mvar: float
+
+    cp0: float
+    cp1: float
+    cp2: float
+
+    @property
+    def label(self) -> str:
+        return f"{self.table}{self.index}@bus{self.bus}"
 
 
 @dataclass(frozen=True)
 class ActionConfig:
     """
-    Defines the 8-dimensional policy action for the IEEE 5-bus case.
+    Layout and physical bounds of the policy action.
 
     Action layout
     -------------
-    action[0:4]:
-        Voltage-related controls.
+    action[0 : n_v]          voltage setpoints of `voltage_buses`
+    action[n_v : n_v + n_g]  active-power setpoints of `generators`
 
-    action[4:8]:
-        Active-power controls for non-slack generators.
-
-    The exact mapping is a reproduction assumption because the paper
-    does not enumerate the individual bus/generator indices.
+    The slack unit is not an action; its P and Q are outputs of the
+    critic (paper Eqs. 15-16).  Its limits and cost are kept here
+    because the critic needs them.
     """
 
-    # ------------------------------------------------------------------
-    # Voltage-related controls
-    # ------------------------------------------------------------------
-    #
-    # Reproduction assumption:
-    # four controlled voltage buses.
-    #
-    # Bus numbering follows pandapower's zero-based indexing.
-    voltage_buses: Tuple[int, ...] = (0, 1, 2, 4)
+    voltage_buses: Tuple[int, ...]
+    voltage_min: Tuple[float, ...]
+    voltage_max: Tuple[float, ...]
 
-    # ------------------------------------------------------------------
-    # Non-slack generator active-power controls
-    # ------------------------------------------------------------------
-    #
-    # Reproduction assumption:
-    # four non-slack generation controls.
-    #
-    # These are represented as generator identifiers rather than assuming
-    # that the policy directly controls reactive power.
-    generator_ids: Tuple[int, ...] = (0, 1, 2, 3)
+    generators: Tuple[GeneratorUnit, ...]
+    slack: GeneratorUnit
 
-    # ------------------------------------------------------------------
-    # Action bounds
-    # ------------------------------------------------------------------
-    #
-    # These are physical bounds used to interpret the normalized policy
-    # output. The exact numerical limits should be populated from the
-    # network/paper before using them for final experiments.
-    #
-    # None means that the physical limit has not yet been assigned here.
-    voltage_min: float = 0.90
-    voltage_max: float = 1.10
-
-    # Placeholder for generator active-power bounds.
-    # These are intentionally not hard-coded here because the exact
-    # generator-specific limits need to come from the implemented case.
-    generator_pmin: Tuple[float, ...] = ()
-    generator_pmax: Tuple[float, ...] = ()
+    base_mva: float
 
     def __post_init__(self) -> None:
-        """Validate the action configuration."""
 
-        if len(self.voltage_buses) != 4:
+        n_v = len(self.voltage_buses)
+
+        if not (n_v == len(self.voltage_min) == len(self.voltage_max)):
             raise ValueError(
-                "The 5-bus paper configuration requires "
-                "4 voltage-related action components."
+                "voltage_buses, voltage_min and voltage_max must "
+                "have equal length."
             )
 
-        if len(self.generator_ids) != 4:
+        for bus, vmin, vmax in zip(
+            self.voltage_buses, self.voltage_min, self.voltage_max
+        ):
+            if vmin >= vmax:
+                raise ValueError(
+                    f"Invalid voltage bounds at bus {bus}: "
+                    f"[{vmin}, {vmax}]."
+                )
+
+        for unit in (*self.generators, self.slack):
+            if unit.p_min_mw > unit.p_max_mw:
+                raise ValueError(f"Pmin > Pmax for {unit.label}.")
+            if unit.q_min_mvar > unit.q_max_mvar:
+                raise ValueError(f"Qmin > Qmax for {unit.label}.")
+
+        if self.slack.bus not in self.voltage_buses:
             raise ValueError(
-                "The 5-bus paper configuration requires "
-                "4 non-slack generator action components."
+                "The slack bus must be a voltage-controlled bus."
             )
 
-        if self.voltage_min >= self.voltage_max:
-            raise ValueError(
-                "voltage_min must be smaller than voltage_max."
-            )
+        if self.base_mva <= 0:
+            raise ValueError("base_mva must be positive.")
 
-        if self.generator_pmin and len(self.generator_pmin) != 4:
-            raise ValueError(
-                "generator_pmin must contain exactly 4 values."
-            )
+    # ------------------------------------------------------------------
+    # Dimensions and index helpers
+    # ------------------------------------------------------------------
 
-        if self.generator_pmax and len(self.generator_pmax) != 4:
-            raise ValueError(
-                "generator_pmax must contain exactly 4 values."
-            )
+    @property
+    def n_voltage(self) -> int:
+        return len(self.voltage_buses)
 
-        if self.generator_pmin and self.generator_pmax:
-            for pmin, pmax in zip(
-                self.generator_pmin,
-                self.generator_pmax,
-            ):
-                if pmin > pmax:
-                    raise ValueError(
-                        "Every generator Pmin must be <= Pmax."
-                    )
+    @property
+    def n_generator(self) -> int:
+        return len(self.generators)
 
     @property
     def action_dim(self) -> int:
-        """Return the policy action dimension."""
-
-        return len(self.voltage_buses) + len(self.generator_ids)
+        """|B_v ∪ B_s| + |G / G_s| (paper, Table 1)."""
+        return self.n_voltage + self.n_generator
 
     @property
     def voltage_action_indices(self) -> Tuple[int, ...]:
-        """Indices occupied by voltage-related controls."""
-
-        return tuple(range(len(self.voltage_buses)))
+        return tuple(range(self.n_voltage))
 
     @property
     def generator_action_indices(self) -> Tuple[int, ...]:
-        """Indices occupied by generator active-power controls."""
+        return tuple(range(self.n_voltage, self.action_dim))
 
-        start = len(self.voltage_buses)
+    # ------------------------------------------------------------------
+    # Bound vectors (convenient for the decoder / critic)
+    # ------------------------------------------------------------------
 
-        return tuple(
-            range(
-                start,
-                start + len(self.generator_ids),
-            )
-        )
+    @property
+    def generator_p_min_mw(self) -> np.ndarray:
+        return np.array([u.p_min_mw for u in self.generators])
+
+    @property
+    def generator_p_max_mw(self) -> np.ndarray:
+        return np.array([u.p_max_mw for u in self.generators])
 
     def describe(self) -> str:
-        """Return a human-readable description of the action layout."""
+        """Human-readable description of the action layout."""
 
         lines = [
-            "D-HELM OPF 5-bus action configuration",
+            "D-HELM OPF action configuration (derived from network)",
             "",
-            "Paper-defined structure:",
-            "  Voltage-related controls : 4",
-            "  Non-slack generator P    : 4",
-            "  Total action dimension   : 8",
+            f"Action dimension : {self.n_voltage} voltage "
+            f"+ {self.n_generator} generator P = {self.action_dim}",
             "",
-            "Reproduction-assumed mapping:",
-            f"  Voltage buses            : {self.voltage_buses}",
-            f"  Generator IDs            : {self.generator_ids}",
-            "",
-            f"Voltage bounds             : "
-            f"[{self.voltage_min}, {self.voltage_max}]",
+            "Voltage setpoints:",
         ]
+
+        for k, (bus, vmin, vmax) in enumerate(
+            zip(self.voltage_buses, self.voltage_min, self.voltage_max)
+        ):
+            kind = "slack" if bus == self.slack.bus else "PV"
+            lines.append(
+                f"  a[{k}]  bus {bus} ({kind:5s})  "
+                f"[{vmin:.2f}, {vmax:.2f}] p.u."
+            )
+
+        lines.append("")
+        lines.append("Generator active-power setpoints:")
+
+        for k, unit in zip(self.generator_action_indices, self.generators):
+            lines.append(
+                f"  a[{k}]  {unit.label:15s}  "
+                f"[{unit.p_min_mw:.1f}, {unit.p_max_mw:.1f}] MW  "
+                f"cost {unit.cp1:.1f} $/MWh"
+            )
+
+        lines.append("")
+        lines.append(
+            f"Slack (critic output, not an action): {self.slack.label}  "
+            f"[{self.slack.p_min_mw:.1f}, {self.slack.p_max_mw:.1f}] MW  "
+            f"cost {self.slack.cp1:.1f} $/MWh"
+        )
 
         return "\n".join(lines)
 
 
-DEFAULT_ACTION_CONFIG = ActionConfig()
+# ----------------------------------------------------------------------
+# Construction from a pandapower network
+# ----------------------------------------------------------------------
+
+def _required(row, column: str, label: str) -> float:
+    """Read a numeric field, refusing to invent a missing value."""
+
+    if column not in row.index or not np.isfinite(float(row[column])):
+        raise ValueError(
+            f"{label}: '{column}' is missing from the network data. "
+            "Supply it in the case definition rather than guessing it."
+        )
+
+    return float(row[column])
+
+
+def _poly_cost(net: pp.pandapowerNet, table: str, index: int):
+    """Return (cp0, cp1, cp2) for one unit from net.poly_cost."""
+
+    rows = net.poly_cost[
+        (net.poly_cost["et"] == table)
+        & (net.poly_cost["element"] == index)
+    ]
+
+    if len(rows) != 1:
+        raise ValueError(
+            f"Expected exactly one poly_cost entry for {table}{index}, "
+            f"found {len(rows)}."
+        )
+
+    row = rows.iloc[0]
+
+    return (
+        float(row["cp0_eur"]),
+        float(row["cp1_eur_per_mw"]),
+        float(row["cp2_eur_per_mw2"]),
+    )
+
+
+def _make_unit(net, table: str, index: int) -> GeneratorUnit:
+
+    row = net[table].loc[index]
+    label = f"{table}{index}"
+
+    cp0, cp1, cp2 = _poly_cost(net, table, index)
+
+    return GeneratorUnit(
+        table=table,
+        index=int(index),
+        bus=int(row["bus"]),
+        p_min_mw=_required(row, "min_p_mw", label),
+        p_max_mw=_required(row, "max_p_mw", label),
+        q_min_mvar=_required(row, "min_q_mvar", label),
+        q_max_mvar=_required(row, "max_q_mvar", label),
+        cp0=cp0,
+        cp1=cp1,
+        cp2=cp2,
+    )
+
+
+def is_wind_sgen(net: pp.pandapowerNet, index: int) -> bool:
+    """True if sgen `index` is a wind unit (tagged by type)."""
+
+    return str(net.sgen.at[index, "type"]) == WIND_SGEN_TYPE
+
+
+def action_config_from_network(net: pp.pandapowerNet) -> ActionConfig:
+    """
+    Derive the action layout, limits and costs from the network.
+
+    Generators are ordered by bus, with `gen` units before `sgen`
+    units on the same bus.
+    """
+
+    if len(net.ext_grid) != 1:
+        raise ValueError(
+            "Exactly one ext_grid (slack) is expected."
+        )
+
+    slack_index = int(net.ext_grid.index[0])
+    slack = _make_unit(net, "ext_grid", slack_index)
+
+    # ------------------------------------------------------------
+    # Controllable non-slack generators: G / G_s
+    # ------------------------------------------------------------
+    units = []
+
+    for index, row in net.gen.iterrows():
+        if bool(row["in_service"]):
+            units.append(_make_unit(net, "gen", index))
+
+    for index, row in net.sgen.iterrows():
+        if (
+            bool(row["in_service"])
+            and bool(row.get("controllable", False))
+            and not is_wind_sgen(net, index)
+        ):
+            units.append(_make_unit(net, "sgen", index))
+
+    table_order = {"gen": 0, "sgen": 1}
+
+    units.sort(key=lambda u: (u.bus, table_order[u.table], u.index))
+
+    # ------------------------------------------------------------
+    # Voltage-controlled buses: B_v ∪ B_s
+    #
+    # Only `gen` units regulate voltage in pandapower; an sgen is a
+    # PQ injection, so it does not add a voltage-controlled bus.
+    # ------------------------------------------------------------
+    voltage_buses = sorted(
+        {
+            int(row["bus"])
+            for _, row in net.gen.iterrows()
+            if bool(row["in_service"])
+        }
+        | {slack.bus}
+    )
+
+    voltage_min = tuple(
+        _required(net.bus.loc[bus], "min_vm_pu", f"bus{bus}")
+        for bus in voltage_buses
+    )
+    voltage_max = tuple(
+        _required(net.bus.loc[bus], "max_vm_pu", f"bus{bus}")
+        for bus in voltage_buses
+    )
+
+    return ActionConfig(
+        voltage_buses=tuple(voltage_buses),
+        voltage_min=voltage_min,
+        voltage_max=voltage_max,
+        generators=tuple(units),
+        slack=slack,
+        base_mva=float(net.sn_mva),
+    )

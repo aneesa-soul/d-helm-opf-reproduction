@@ -39,6 +39,13 @@ import numpy as np
 import pandapower as pp
 
 
+# Wind units are pandapower sgens tagged with this type label
+# (pandapower's convention for wind power).  The tag is what separates
+# them from controllable conventional sgens such as sgen0 at bus 0 in
+# the IEEE 5-bus case.
+WIND_SGEN_TYPE = "WP"
+
+
 @dataclass(frozen=True)
 class UncertaintyConfig:
     """
@@ -244,12 +251,16 @@ def apply_wind_output(
 
         output_mw = float(scale * rated)
 
-        # Represent wind explicitly as a static generator (sgen).
-        # This keeps wind generation separate from the conventional
-        # controllable generators in net.gen.
+        # Represent wind explicitly as a static generator (sgen)
+        # tagged with type WIND_SGEN_TYPE and controllable=False.
+        #
+        # Only an existing WIND sgen on this bus is reused.  Matching
+        # on bus alone would overwrite a conventional sgen (e.g. the
+        # 170 MW sgen0 at bus 0 in the IEEE 5-bus case).
 
         existing = net.sgen.index[
-            net.sgen["bus"] == bus
+            (net.sgen["bus"] == bus)
+            & (net.sgen["type"] == WIND_SGEN_TYPE)
         ].tolist()
 
         if existing:
@@ -269,6 +280,8 @@ def apply_wind_output(
                 scaling=1.0,
                 in_service=True,
                 name=f"wind_bus_{bus}",
+                type=WIND_SGEN_TYPE,
+                controllable=False,
             )
 
         print(
