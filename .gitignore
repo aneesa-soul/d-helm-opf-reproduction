@@ -26,3 +26,6 @@ results/tables/
 # Large/local data
 data/*
 !data/.gitkeep
+
+# Training runs (metrics, checkpoints, plots)
+results/runs/

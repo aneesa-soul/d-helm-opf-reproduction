@@ -174,18 +174,65 @@ Validation (`scripts/test_dhelm_critic.py`), on 100 random samples over the full
 * The ramping constraint gives the expected violation.
 * gradcheck passes for r and z with respect to both action and state.
 
-### 8. Physics-informed DRL
+### 8. Policy and constrained policy optimization
 
-**Status: Not yet implemented**
+**Status: Implemented and validated. It learns a feasible policy, but is not yet at the paper's claimed optimality within 500 steps.**
 
-The following components remain to be implemented and validated:
+Components:
 
-* Policy network.
-* Reinforcement-learning environment/interface.
-* Policy optimization algorithm.
-* Training procedure.
-* Baselines.
-* Experimental evaluation.
+* `models/policy.py`: a deterministic policy, LSTM(64) → Dense 64 → Dense 64 (SELU), with a tanh output (Eq. 18).
+* `environment/state_sampler.py`: draws states in the paper's ranges and keeps the states-only replay buffer (Fig. 2b), stored in episode order so it can return windows of consecutive states.
+* `algorithms/dhelm_cpo.py`: the loss −mean(r) + Σ λₙ mean(zₙ) (Eq. 19, A.1) and the λ update (Eq. 20), with λ⁽⁰⁾ = 10, Adam at lr 1e-3 and minibatch 32 (Table 1). There is no critic training and no target network, because gradients flow through the exact D-HELM critic.
+* `algorithms/case5_setup.py`: builds the full 5-bus agent in one call.
+* `scripts/train_dhelm_case5.py`: writes `metrics.csv`, `policy.pt` and `training.png` to `results/runs/<name>/` (git-ignored).
+* `scripts/evaluate_vs_opf.py`: compares the policy with pandapower's AC OPF on 100 held-out states.
+
+Reproduction choices:
+
+* **Policy input = 8 states + the previous normalized P actions of the 4 non-slack units**, giving 12 inputs. The Table 1 symbol is unreadable. |G/G_s| fits the 5- and 30-bus columns, while the 118- and 300-bus columns are one larger. Our derived *output* sizes match Table 1 for all four systems.
+* **The LSTM runs autoregressively over a window of L consecutive states**, feeding back its own previous generator action. That action is 0 at the start of a window. Episodes are 25 steps long, inferred from "20 episodes (≤ 500 steps)".
+* **States are scaled to [-1, 1]** with the sampling ranges before entering the network.
+* **η_λ = 1.0 and λ_max = 1000.** The paper gives neither. As written, Eq. (20) never decreases λ.
+
+Matching the OPF reference to the paper's problem. Two adjustments are needed, both found during this step:
+
+1. **Unrated lines must be unconstrained in the OPF.** pandapower turns max_i_ka = 99,999 into ~4×10⁷ MVA limits. The interior-point multipliers then blow up and `runopp` converges on only 28/100 states with high wind at bus 4. With those lines unconstrained it converges on 100/100, and the costs on the previously converging states are unchanged (0.02 $/h).
+2. **The slack voltage must be free.** pandapower's OPF holds the ext_grid at its setpoint (1.0 p.u.). In the paper the slack voltage is an action (B_s in Eq. 4). For evaluation the ext_grid is therefore replaced by an equivalent slack `gen`, which the OPF sets to about 1.095 p.u. That lowers the mean OPF cost from 9,518 to 8,541 $/h. Against the fixed-slack OPF, a trained policy appeared to beat the "optimum" on more than half the states.
+
+Line limits already match: pandapower's OPF uses current magnitude (`OPF_FLOW_LIM = 2`), as in Eqs. (16d)–(16e). Each OPF solution passed through the critic reproduces its own cost to 0.02 $/h, with Σz ≤ 5×10⁻⁷.
+
+Results on 100 held-out states, against the matched OPF (mean 8,541 $/h):
+
+| Run | Steps | Feasible | Mean gap | Median gap |
+|---|---|---|---|---|
+| L = 1 | 500 | 97% | +31.5% | +33.9% |
+| L = 5 | 500 | 94% | +22.8% | +23.1% |
+| L = 1, batch 160 | 500 | 94% | +24.6% | +27.1% |
+| L = 1 | 2,500 | 100% | +12.4% | +10.3% |
+
+Timing: the policy plus critic takes about 9 ms for all 100 states, against about 800 ms per state for the OPF.
+
+Observations:
+
+* **Violations collapse within about 100 steps, then the cost falls slowly.** At 500 steps the policy is feasible but not near-optimal, whereas the paper reports convergence within 500 steps. The cost is still falling at 2,500 steps.
+* **L = 5 does about as well as L = 1 with a batch of 160.** Its advantage comes from seeing 5× more states per update, not from LSTM memory. That is expected, since states are i.i.d. and ramping is off.
+* **λ barely moves (10 → 11.4)**, because z ≈ 0 after the first ~100 steps.
+* **The number of D-HELM terms N rises from 5 to 9 during training**, as the policy moves toward more heavily loaded, cheaper operating points.
+
+Validation (`scripts/test_policy_training.py`):
+
+* Shapes and the 12-input layout are correct.
+* The autoregressive feedback works as intended.
+* Buffer windows are consecutive states.
+* Gradients reach all 28,808 parameters through the critic.
+* The Eq. (20) update and clipping are correct.
+* A 60-step smoke run lowers the loss.
+
+### 9. Remaining work
+
+* Closing the optimality gap: longer training, the learning rate, the λ schedule, and the post-training "few gradient steps" refinement of Remark 5.
+* Baselines: SAC, PPO and DDPG (Tianshou, gymnasium environment) and MBPO.
+* The 30-, 118- and 300-bus systems.
 
 ---
 
@@ -226,9 +273,6 @@ The following are complete and validated:
 * The differentiable, batched PyTorch D-HELM, with its forward pass and gradients both verified.
 * The physics-driven critic: Eqs. (15), (16), (6) and (5), checked against pandapower and verified with gradcheck.
 
-The next implementation target is the policy and the constrained policy optimization:
+* The policy and the Lagrangian training (Eqs. 18–20), plus an evaluation against an OPF reference matched to the paper's problem.
 
-* The policy network (Table 1: LSTM + 2 dense layers, SELU).
-* The tanh action scaling of Eq. (18).
-* The Lagrangian objective of Eq. (19) with the λ update of Eq. (20).
-* The training loop that uses the critic's analytic gradients.
+Training learns feasible policies (100% feasible after 2,500 steps), but the gap to the OPF is still +12% and the cost is still falling. The next target is closing that gap (Section 9).
