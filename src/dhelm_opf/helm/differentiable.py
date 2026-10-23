@@ -69,11 +69,14 @@ class DHelmSpecs:
                                  (q_spec is only used at PQ buses)
     v_sp           : (B, n_bus)  voltage-magnitude setpoints
                                  (only PV and slack entries are used)
+    p_gen          : (B, n_gen)  active power of the controllable
+                                 non-slack units, in ActionConfig order
     """
 
     p_spec: torch.Tensor
     q_spec: torch.Tensor
     v_sp: torch.Tensor
+    p_gen: torch.Tensor
 
 
 @dataclass
@@ -179,7 +182,9 @@ class DHelmNetwork(torch.nn.Module):
             )
 
         def t(x):
-            return torch.as_tensor(np.asarray(x), dtype=DTYPE, device=device)
+            # np.array(...) copies: pandas can hand out read-only arrays,
+            # which torch.as_tensor would otherwise share (UserWarning).
+            return torch.tensor(np.array(x, dtype=float), dtype=DTYPE, device=device)
 
         LU, pivots = torch.linalg.lu_factor(t(A))
         self.register_buffer("LU", LU)
@@ -338,7 +343,12 @@ class DHelmNetwork(torch.nn.Module):
 
         v_sp = v_set @ self.V_map
 
-        return DHelmSpecs(p_spec=p_spec, q_spec=q_spec, v_sp=v_sp)
+        return DHelmSpecs(
+            p_spec=p_spec,
+            q_spec=q_spec,
+            v_sp=v_sp,
+            p_gen=p_gen,
+        )
 
     # ------------------------------------------------------------------
     # Helpers in real arithmetic

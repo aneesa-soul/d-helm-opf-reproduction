@@ -140,15 +140,46 @@ The ordering of the four generator actions (by bus, then `gen` before `sgen`) is
 
 Validation: `scripts/test_action_config.py` and `scripts/test_action_decoder.py`. The decoder test also confirms that HELM matches pandapower (max error 5×10⁻¹¹) over 50 random actions with random uncertainty.
 
-### 7. Physics-informed DRL
+### 7. Physics-driven critic (`models/dhelm_critic.py`)
 
-### 6. Physics-informed DRL
+**Status: Complete and validated.**
+
+`DHELMCritic` takes the batched D-HELM solution and computes the critic quantities, all differentiable with respect to the action and the state:
+
+* Slack P, Eq. (15).
+* PQ-bus voltages, Eq. (16a).
+* Slack P limits with optional ramping, Eq. (16b).
+* Unit Q at the voltage buses, Eq. (16c).
+* Sending- and receiving-end line currents, Eqs. (16d)–(16e).
+* The violation vector z, Eq. (6).
+* The reward r, Eq. (5).
+
+PV and slack voltages are not constraints, because they are actions bounded by Eq. (18). The Lagrangian of Eqs. (19)–(20) is left to the training algorithm.
+
+For the 5-bus case there are 10 constraints: v[bus1], p_slack, q at buses 0, 2, 3 and 4, and i_from / i_to for line 0 (1.004 kA) and line 5 (0.602 kA).
+
+Reproduction choices and interpretations:
+
+* **Q limits are per bus (Eq. 16c literally).** A bus limit is the sum of the limits of the controllable units on it. Bus 0 (gen0 ±30 and sgen0 ±127.5) therefore has ±157.5 MVAr. This also matches how pandapower's OPF treats a controllable sgen.
+* **η_n = 1 / (x̄_n − x̲_n)** is our reading of Table 1's "η = (Z_max − Z_min)⁻¹". For line currents the bounds of Eqs. (16d)–(16e) are −i … i, so η = 1 / (2 i_max).
+* **w_r = 1 / cost_max** is our reading of Table 1's "w_r = cost1max". Here cost_max = Σ f_g(P̄_g) over all units, slack included, which is 32,710 $/h. With w₀ = 2 the reward lies roughly in [1, 2].
+* **Ramping (16b) is implemented but off by default.** The case data has no ramp rates, and the paper's states are sampled independently, with no time series. `CriticConfig.ramp_up_mw` / `ramp_down_mw` and the critic input `p_slack_prev_mw` enable it.
+* **Lines with no rating have no current constraint.** In case5, lines 1–4 have pandapower's placeholder max_i_ka = 99,999 kA, which comes from MATPOWER rateA = 0.
+
+Validation (`scripts/test_dhelm_critic.py`), on 100 random samples over the full action range:
+
+* Slack P, unit Q per bus, PQ voltage, line currents and cost all match pandapower's `res_*` tables, to 1×10⁻⁸ MW/MVAr or better.
+* z and r match an independent NumPy computation that reads the limits directly from the network tables (3×10⁻¹¹).
+* Every one of the 10 constraints is violated in at least one sample, so each branch of Eq. (6) is exercised.
+* The ramping constraint gives the expected violation.
+* gradcheck passes for r and z with respect to both action and state.
+
+### 8. Physics-informed DRL
 
 **Status: Not yet implemented**
 
 The following components remain to be implemented and validated:
 
-* Physics-derived critic: Eqs. (15)–(16), violations (6), reward (5), built on the differentiable D-HELM.
 * Policy network.
 * Reinforcement-learning environment/interface.
 * Policy optimization algorithm.
@@ -193,5 +224,11 @@ The following are complete and validated:
 * The NumPy HELM reference solver, which matches pandapower.
 * The action space derived from the network.
 * The differentiable, batched PyTorch D-HELM, with its forward pass and gradients both verified.
+* The physics-driven critic: Eqs. (15), (16), (6) and (5), checked against pandapower and verified with gradcheck.
 
-The next implementation target is the critic outputs on top of D-HELM: slack P (15), the PQ-voltage, slack ramping, generator Q and line-current constraints (16), the violations (6) and the reward (5).
+The next implementation target is the policy and the constrained policy optimization:
+
+* The policy network (Table 1: LSTM + 2 dense layers, SELU).
+* The tanh action scaling of Eq. (18).
+* The Lagrangian objective of Eq. (19) with the λ update of Eq. (20).
+* The training loop that uses the critic's analytic gradients.
