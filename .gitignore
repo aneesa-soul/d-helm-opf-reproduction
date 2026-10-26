@@ -29,3 +29,7 @@ data/*
 
 # Training runs (metrics, checkpoints, plots)
 results/runs/
+
+# Multi-seed experiment summaries and the cached OPF reference
+results/experiments/
+results/opf_reference/

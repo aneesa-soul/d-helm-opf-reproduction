@@ -12,21 +12,27 @@ Loop (paper Fig. 2b; Table 1 for the 5-bus hyperparameters):
             multiplier update lambda_n += eta * mean(z_n)          (20)
 
 Every `--eval-every` steps the policy is evaluated on a fixed held-out
-set of states, so the curves are not affected by minibatch noise.
+VALIDATION set of states, so the curves are not affected by minibatch
+noise.  The same evaluations select the best checkpoint: the lowest
+validation cost among evaluations with >= `--best-feasible` feasible
+states (fallback: lowest validation loss).
 
 Outputs (in results/runs/<name>/):
-    metrics.csv   one row per evaluation
-    policy.pt     policy weights, multipliers and the run configuration
-    training.png  learning curves
+    metrics.csv      one row per evaluation
+    policy.pt        last policy, multipliers and the run configuration
+    policy_best.pt   best checkpoint (see above)
+    summary.json     last vs best step, cost, feasibility
+    training.png     learning curves (best step marked)
 
 Examples:
     python scripts/train_dhelm_case5.py --window 1 --name case5_L1
-    python scripts/train_dhelm_case5.py --window 5 --name case5_L5
+    python scripts/train_dhelm_case5.py --episodes 100 --lr-schedule cosine
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import time
@@ -41,7 +47,7 @@ from dhelm_opf.algorithms.dhelm_cpo import CPOConfig
 from dhelm_opf.environment.state_sampler import StateBuffer, StateSampler
 
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--episodes", type=int, default=20)
@@ -53,15 +59,25 @@ def parse_args():
     p.add_argument("--lambda-max", type=float, default=1000.0)
     p.add_argument("--eval-size", type=int, default=256)
     p.add_argument("--eval-every", type=int, default=5)
+    p.add_argument("--lr-schedule", choices=("constant", "cosine"),
+                   default="constant",
+                   help="constant = paper (Table 1); cosine decays to "
+                        "lr * lr-min-factor over the run")
+    p.add_argument("--lr-min-factor", type=float, default=0.1)
+    p.add_argument("--best-feasible", type=float, default=0.99,
+                   help="validation feasible share required for the "
+                        "best checkpoint")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--name", type=str, default=None)
     p.add_argument("--out", type=str, default="results/runs")
-    return p.parse_args()
+    p.add_argument("--quiet", action="store_true",
+                   help="print only the final summary line")
+    return p.parse_args(argv)
 
 
-def main() -> None:
+def main(argv=None) -> Path:
 
-    args = parse_args()
+    args = parse_args(argv)
     name = args.name or f"case5_L{args.window}_seed{args.seed}"
     out_dir = Path(args.out) / name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -77,7 +93,17 @@ def main() -> None:
     agent = make_case5_agent(seed=args.seed, cpo_config=cpo_config)
     cpo, sampler = agent.cpo, agent.sampler
 
-    # Held-out evaluation windows (separate seed, never trained on).
+    total_steps = args.episodes * args.episode_length
+    scheduler = None
+    if args.lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            cpo.optimizer, T_max=total_steps,
+            eta_min=args.lr * args.lr_min_factor,
+        )
+
+    # Validation windows: never trained on, and distinct from the test
+    # states used by evaluate_vs_opf.py (seed 20000).  They draw the
+    # learning curves and select the best checkpoint.
     eval_sampler = StateSampler(
         agent.dhelm.n_load, agent.dhelm.n_wind, agent.uncertainty,
         seed=10_000 + args.seed,
@@ -93,16 +119,48 @@ def main() -> None:
     step = 0
     start = time.perf_counter()
 
+    # Best checkpoint: lowest validation cost among evaluations with at
+    # least `best_feasible` feasible validation states.  Fallback (if no
+    # evaluation qualifies): lowest validation loss.
+    best = {"feasible": None, "loss": None}
+
+    def snapshot(m):
+        return {
+            "policy": copy.deepcopy(agent.policy.state_dict()),
+            "lambdas": cpo.lambdas.clone(),
+            "step": m["step"],
+            "cost": m["cost"],
+            "feasible": m["feasible"],
+            "loss": m["loss"],
+        }
+
     def log(step, episode):
         m = cpo.evaluate_metrics(eval_states)
         m.update(step=step, episode=episode,
-                 seconds=time.perf_counter() - start)
+                 seconds=time.perf_counter() - start,
+                 lr=cpo.optimizer.param_groups[0]["lr"])
         rows.append(m)
+
+        if step > 0:
+            if m["feasible"] >= args.best_feasible and (
+                best["feasible"] is None or m["cost"] < best["feasible"]["cost"]
+            ):
+                best["feasible"] = snapshot(m)
+            if best["loss"] is None or m["loss"] < best["loss"]["loss"]:
+                best["loss"] = snapshot(m)
         return m
 
+    def report(m, episode=None):
+        if args.quiet:
+            return
+        tail = (f"  max lambda {cpo.lambdas.max().item():7.2f}  (episode {episode})"
+                if episode else "")
+        print(f"step {m['step']:4d}  reward {m['reward']:.4f}  "
+              f"cost {m['cost']:8.1f}  violation {m['violation']:.4f}  "
+              f"feasible {m['feasible']:.2f}{tail}")
+
     m = log(0, 0)
-    print(f"step {0:4d}  reward {m['reward']:.4f}  cost {m['cost']:8.1f}  "
-          f"violation {m['violation']:.4f}  feasible {m['feasible']:.2f}")
+    report(m)
 
     for episode in range(1, args.episodes + 1):
 
@@ -112,14 +170,13 @@ def main() -> None:
             windows = buffer.sample_windows(args.batch_size, args.window, rng)
             cpo.train_step(windows)
             step += 1
+            if scheduler is not None:
+                scheduler.step()
 
             if step % args.eval_every == 0:
                 m = log(step, episode)
 
-        print(f"step {step:4d}  reward {m['reward']:.4f}  cost {m['cost']:8.1f}  "
-              f"violation {m['violation']:.4f}  feasible {m['feasible']:.2f}  "
-              f"max lambda {cpo.lambdas.max().item():7.2f}  "
-              f"(episode {episode})")
+        report(m, episode)
 
     # ---- save -------------------------------------------------------
     with open(out_dir / "metrics.csv", "w", newline="") as f:
@@ -127,24 +184,53 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
+    common = {
+        "cpo_config": asdict(cpo_config),
+        "args": vars(args),
+        "constraint_names": agent.critic.constraint_names,
+    }
+
     torch.save(
-        {
-            "policy": agent.policy.state_dict(),
-            "lambdas": cpo.lambdas,
-            "cpo_config": asdict(cpo_config),
-            "args": vars(args),
-            "constraint_names": agent.critic.constraint_names,
-        },
+        {"policy": agent.policy.state_dict(), "lambdas": cpo.lambdas,
+         "step": step, **common},
         out_dir / "policy.pt",
     )
+
+    if best["feasible"] is not None:
+        chosen, criterion = best["feasible"], (
+            f"lowest validation cost with feasible >= {args.best_feasible}"
+        )
+    else:
+        chosen, criterion = best["loss"], "lowest validation loss (fallback)"
+
+    torch.save(
+        {"policy": chosen["policy"], "lambdas": chosen["lambdas"],
+         "step": chosen["step"], "criterion": criterion, **common},
+        out_dir / "policy_best.pt",
+    )
+
+    summary = {
+        "last": {k: rows[-1][k] for k in ("step", "cost", "feasible", "loss")},
+        "best": {k: chosen[k] for k in ("step", "cost", "feasible", "loss")},
+        "best_criterion": criterion,
+        "seconds": time.perf_counter() - start,
+    }
+    with open(out_dir / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
 
     with open(out_dir / "config.json", "w") as f:
         json.dump({"args": vars(args), "cpo_config": asdict(cpo_config)},
                   f, indent=2)
 
-    plot(rows, agent.critic.constraint_names, out_dir / "training.png", name)
+    plot(rows, agent.critic.constraint_names, out_dir / "training.png", name,
+         best_step=chosen["step"])
 
-    print(f"\nSaved to {out_dir}/  ({time.perf_counter() - start:.1f} s)")
+    print(f"{name}: last step {step} cost {rows[-1]['cost']:.1f} "
+          f"feasible {rows[-1]['feasible']:.2f} | best step {chosen['step']} "
+          f"cost {chosen['cost']:.1f} feasible {chosen['feasible']:.2f} "
+          f"| saved to {out_dir}/ ({time.perf_counter() - start:.1f} s)")
+
+    return out_dir
 
 
 # ----------------------------------------------------------------------
@@ -158,7 +244,7 @@ SURFACE = "#fcfcfb"
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a"]   # categorical slots 1-3
 
 
-def plot(rows, names, path, title):
+def plot(rows, names, path, title, best_step=None):
 
     import matplotlib
     matplotlib.use("Agg")
@@ -174,7 +260,7 @@ def plot(rows, names, path, title):
         ("reward", "Reward (Eq. 5)", None),
         ("cost", "Operating cost ($/h)", None),
         ("violation", "Total violation  Σz (Eq. 6)", None),
-        ("feasible", "Feasible share of eval states", (0, 1.02)),
+        ("feasible", "Feasible share of validation states", (0, 1.02)),
         ("helm_terms", "D-HELM terms N", None),
     ]
 
@@ -183,6 +269,11 @@ def plot(rows, names, path, title):
         ax.set_title(label, color=INK, fontsize=10, loc="left")
         if ylim:
             ax.set_ylim(*ylim)
+        if best_step is not None and key in ("cost", "feasible"):
+            ax.axvline(best_step, color=INK_2, lw=1, ls="--")
+            ax.annotate("best", (best_step, 1.0), xycoords=("data", "axes fraction"),
+                        xytext=(3, -10), textcoords="offset points",
+                        color=INK_2, fontsize=8)
 
     # Multipliers: the three that grew most, plus a legend.
     ax = axes.flat[5]

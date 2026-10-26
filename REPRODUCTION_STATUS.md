@@ -228,9 +228,66 @@ Validation (`scripts/test_policy_training.py`):
 * The Eq. (20) update and clipping are correct.
 * A 60-step smoke run lowers the loss.
 
-### 9. Remaining work
+### 9. Multi-seed evaluation and refinement (R1 / R2)
 
-* Closing the optimality gap: longer training, the learning rate, the λ schedule, and the post-training "few gradient steps" refinement of Remark 5.
+**Status: Complete. Results are reported over 5 seeds against a cached, matched OPF reference.**
+
+Components:
+
+* **Best checkpoint** (`scripts/train_dhelm_case5.py`). Among the validation evaluations (256 states, seed 10000 + seed, never trained on), it is the one with the lowest validation cost that has ≥ 99% feasible states. If none qualifies, the lowest validation loss is used instead. The output files are `policy_best.pt` and `summary.json`.
+* **Optional cosine learning-rate decay** (`--lr-schedule cosine`, decaying to 10% of the initial rate). The default is constant, as in the paper.
+* **Cached OPF reference** (`utils/opf_reference.py`). The matched OPF (unrated lines unconstrained, slack voltage free; see Section 8) is solved once for the 100 test states (seed 20000) and stored in `results/opf_reference/`. It is reused only if the states match exactly.
+* **Shared evaluation** (`utils/evaluation.py`). This is used by `scripts/evaluate_vs_opf.py` (`--checkpoint best|last`, `--refine none|r1|r2`, `--refine-steps K`) and by `scripts/run_seeds.py`, so both report identical numbers.
+* **Refinement** (`algorithms/refine.py`). Gradient steps on each state's action through the critic, on J = −r + Σ λₙ zₙ with the trained λ. The policy weights are untouched. The variable is the pre-tanh action, so actions stay in bounds. Each state keeps its best iterate: feasible beats infeasible, then lower cost, then lower violation. The starting action counts as a candidate, and iterates where D-HELM did not converge are rejected, so refinement never makes a state worse. Defaults: Adam, lr 0.03.
+  * **R1, paper-faithful (Remark 5).** Only states that fail the feasibility test are refined, and each stops as soon as it is feasible. Feasible states are returned unchanged.
+  * **R2, our extension.** Every state is refined for K steps, which lowers the cost as well. The policy becomes a warm start for a first-order OPF solve through the critic.
+* **Runners.** `scripts/run_seeds.py` trains N seeds and evaluates the last checkpoint, the best checkpoint, best + R1, and best + R2 at K = 5, 20, 50 and 200. `scripts/compare_experiments.py` prints experiments side by side.
+
+Results: 5 seeds (0–4), 100 test states, mean ± std over seeds. The OPF reference averages 8,541 $/h. Every OPF solution passed through the critic reproduces its cost to 5×10⁻³ $/h, with Σz ≤ 5×10⁻⁷.
+
+Optimality gap against the OPF:
+
+| Variant | 2,500 steps | 2,500 steps, cosine LR | 5,000 steps |
+|---|---|---|---|
+| last checkpoint | +6.77% ± 3.16 | +9.32% ± 1.87 | +3.52% ± 0.48 |
+| best checkpoint | +5.44% ± 0.74 | +9.34% ± 2.01 | +3.44% ± 0.27 |
+| best + R1 (K = 20) | +5.50% ± 0.74 | +9.39% ± 2.02 | +3.51% ± 0.25 |
+| best + R2 (K = 5) | +4.06% ± 0.45 | +8.27% ± 1.76 | +2.64% ± 0.13 |
+| best + R2 (K = 50) | +3.59% ± 0.34 | +7.48% ± 1.64 | +2.41% ± 0.10 |
+| best + R2 (K = 200) | +2.53% ± 0.23 | +5.98% ± 1.38 | **+1.78% ± 0.09** |
+
+Feasible test states:
+
+| Variant | 2,500 steps | 2,500 steps, cosine LR | 5,000 steps |
+|---|---|---|---|
+| last checkpoint | 93.4% | 98.4% | 89.2% |
+| best checkpoint | 98.8% | 98.8% | 98.4% |
+| best + R1 / R2 | 100% | 100% | 100%¹ |
+
+¹ R2 at K = 5 reaches 99.8%: one state was not yet fixed within 5 steps.
+
+Time per state on CPU, for the 5,000-step run:
+
+* Policy alone: about 0.1 ms.
+* Policy + R1: about 1 ms.
+* Policy + R2: about 5 ms at K = 20 and about 44 ms at K = 200.
+* pandapower OPF: 300–800 ms, depending on the machine.
+
+Findings:
+
+* **Seed noise is large in the last checkpoint.** Its std over seeds is 3.2 percentage points at 2,500 steps. Selecting the best checkpoint by validation cuts this more than 4×, to 0.7, and raises feasibility. All comparisons therefore use the best checkpoint.
+* **Training length is the main lever.** The gap shrinks from 5.4% to 3.4% when training doubles from 2,500 to 5,000 steps. The paper reports near-optimal policies within 500 steps, which is not reproduced here.
+* **Cosine LR decay hurts** (+9.3% against +5.4%). The policy is under-trained rather than oscillating, so decaying the step size slows the descent. Constant LR (the paper's setting) is kept.
+* **R1 reproduces the paper's claim.** A few gradient steps on the infeasible states give 100% feasibility on every seed, with a negligible effect on cost (+0.06 points). R1 touches only the 1–2% of states the best checkpoint leaves infeasible.
+* **R2 is the improvement.** It brings the 5,000-step policy to +1.8% ± 0.1 at 100% feasibility, while still running 7–18× faster than the OPF.
+* **Why R2 stalls.** In many states the optimum lies on the action bounds (gen2 at 600 MW, other units at 0, voltages at 1.1 p.u.) and on the slack's 0 MW lower limit. The remaining improving direction runs *along* that limit, shifting power between units at roughly 5 $/MWh saving, while the penalty kink is about 60× steeper. Penalty-gradient steps therefore zig-zag across the boundary and progress slowly.
+* **Things that did not help R2:** larger λ, projected gradient steps in action space, and a decaying step size.
+
+### 10. Remaining work
+
+* A constrained refinement using the critic's exact Jacobians (SQP or augmented Lagrangian) to remove R2's boundary crawl.
+* Training-side improvements toward the paper's 500-step claim, such as learning rate and network size. Since the optimum often lies at action bounds, the tanh parametrization (Eq. 18) is worth examining.
+* The physics-informed extensions planned for this project.
 * Baselines: SAC, PPO and DDPG (Tianshou, gymnasium environment) and MBPO.
 * The 30-, 118- and 300-bus systems.
 
@@ -272,7 +329,12 @@ The following are complete and validated:
 * The action space derived from the network.
 * The differentiable, batched PyTorch D-HELM, with its forward pass and gradients both verified.
 * The physics-driven critic: Eqs. (15), (16), (6) and (5), checked against pandapower and verified with gradcheck.
-
 * The policy and the Lagrangian training (Eqs. 18–20), plus an evaluation against an OPF reference matched to the paper's problem.
+* The multi-seed evaluation, and the R1 (paper, Remark 5) and R2 (extension) refinements (Section 9).
 
-Training learns feasible policies (100% feasible after 2,500 steps), but the gap to the OPF is still +12% and the cost is still falling. The next target is closing that gap (Section 9).
+Results, over 5 seeds against the matched OPF:
+
+* **Reproduction:** with the paper's settings plus R1, after 5,000 steps, the gap is +3.5% at 100% feasibility. The paper's near-optimality within 500 steps is not reproduced.
+* **Improvement:** with R2 (K = 200) the gap is +1.8% ± 0.1 at 100% feasibility, at about 44 ms per state against 300–800 ms for the OPF.
+
+Next targets are listed in Section 10.
