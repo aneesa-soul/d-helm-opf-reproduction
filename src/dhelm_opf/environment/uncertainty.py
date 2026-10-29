@@ -64,9 +64,9 @@ class UncertaintyConfig:
     # Replication assumption:
     # The paper specifies two wind buses, but their exact placement
     # is not available in the publicly accessible material.
-    wind_buses: tuple[int, ...] = (1, 4)
+    B_w: tuple[int, ...] = (1, 4)
     # Replication assumption: 100 MW rated wind capacity at each bus.
-    wind_rated_mw: tuple[float, ...] = (100.0, 100.0)
+    p_w_rated_mw: tuple[float, ...] = (100.0, 100.0)
 
 
 @dataclass(frozen=True)
@@ -78,9 +78,9 @@ class OperatingScenario:
     table entries / configured wind buses.
     """
 
-    demand_p_scale: np.ndarray
-    demand_q_scale: np.ndarray
-    wind_scale: np.ndarray
+    p_d_scale: np.ndarray
+    q_d_scale: np.ndarray
+    p_w_scale: np.ndarray
 
 
 def validate_uncertainty_config(
@@ -103,7 +103,7 @@ def validate_uncertainty_config(
             f"3 demand entries, but the network has {len(net.load)}."
         )
 
-    if len(config.wind_buses) != 2:
+    if len(config.B_w) != 2:
         raise ValueError(
             "The paper's 5-bus configuration requires exactly "
             "2 wind buses. Supply their exact indices from the "
@@ -112,7 +112,7 @@ def validate_uncertainty_config(
 
     n_bus = len(net.bus)
 
-    for bus in config.wind_buses:
+    for bus in config.B_w:
         if bus < 0 or bus >= n_bus:
             raise ValueError(
                 f"Wind bus index {bus} is outside the "
@@ -140,34 +140,34 @@ def sample_scenario(
         [0.40, 1.00]
     """
 
-    if len(config.wind_buses) != 2:
+    if len(config.B_w) != 2:
         raise ValueError(
             "Two exact wind buses must be configured before "
             "sampling a 5-bus scenario."
         )
 
-    demand_p_scale = rng.uniform(
+    p_d_scale = rng.uniform(
         config.demand_min,
         config.demand_max,
         size=3,
     )
 
-    demand_q_scale = rng.uniform(
+    q_d_scale = rng.uniform(
         config.demand_min,
         config.demand_max,
         size=3,
     )
 
-    wind_scale = rng.uniform(
+    p_w_scale = rng.uniform(
         config.wind_min,
         config.wind_max,
         size=2,
     )
 
     return OperatingScenario(
-        demand_p_scale=demand_p_scale,
-        demand_q_scale=demand_q_scale,
-        wind_scale=wind_scale,
+        p_d_scale=p_d_scale,
+        q_d_scale=q_d_scale,
+        p_w_scale=p_w_scale,
     )
 
 
@@ -179,7 +179,7 @@ def apply_demand_uncertainty(
     Apply realized active/reactive demand scaling to the network.
     """
 
-    if len(net.load) != len(scenario.demand_p_scale):
+    if len(net.load) != len(scenario.p_d_scale):
         raise ValueError(
             "Number of demand scaling values does not match "
             "the number of loads."
@@ -187,20 +187,20 @@ def apply_demand_uncertainty(
 
     net.load["p_mw"] = (
         net.load["p_mw"].to_numpy()
-        * scenario.demand_p_scale
+        * scenario.p_d_scale
     )
 
     net.load["q_mvar"] = (
         net.load["q_mvar"].to_numpy()
-        * scenario.demand_q_scale
+        * scenario.q_d_scale
     )
 
 
 def apply_wind_output(
     net: pp.pandapowerNet,
-    wind_buses: Sequence[int],
-    wind_scale: Sequence[float],
-    wind_rated_mw: Sequence[float],
+    B_w: Sequence[int],
+    p_w_scale: Sequence[float],
+    p_w_rated_mw: Sequence[float],
 ) -> None:
     """
     Apply realized wind output.
@@ -215,30 +215,30 @@ def apply_wind_output(
     net:
         Pandapower network.
 
-    wind_buses:
+    B_w:
         Exact wind-bus indices.
 
-    wind_scale:
+    p_w_scale:
         Realized [0.40, 1.00] scaling factors.
 
-    wind_rated_mw:
+    p_w_rated_mw:
         Rated wind outputs for the configured wind buses.
     """
 
-    if len(wind_buses) != len(wind_scale):
+    if len(B_w) != len(p_w_scale):
         raise ValueError(
-            "wind_buses and wind_scale must have equal length."
+            "B_w and p_w_scale must have equal length."
         )
 
-    if len(wind_buses) != len(wind_rated_mw):
+    if len(B_w) != len(p_w_rated_mw):
         raise ValueError(
-            "wind_buses and wind_rated_mw must have equal length."
+            "B_w and p_w_rated_mw must have equal length."
         )
 
     for bus, scale, rated in zip(
-        wind_buses,
-        wind_scale,
-        wind_rated_mw,
+        B_w,
+        p_w_scale,
+        p_w_rated_mw,
     ):
         if bus < 0 or bus >= len(net.bus):
             raise ValueError(f"Invalid wind bus: {bus}")
@@ -308,14 +308,14 @@ def scenario_to_state(
     if len(net.load) != 3:
         raise ValueError("Expected 3 loads for the 5-bus case.")
 
-    if len(scenario.wind_scale) != 2:
+    if len(scenario.p_w_scale) != 2:
         raise ValueError("Expected 2 wind values for the 5-bus case.")
 
     state = np.concatenate(
         [
-            scenario.demand_p_scale,
-            scenario.demand_q_scale,
-            scenario.wind_scale,
+            scenario.p_d_scale,
+            scenario.q_d_scale,
+            scenario.p_w_scale,
         ]
     )
 
@@ -334,8 +334,8 @@ if __name__ == "__main__":
     net = build_case5()
 
     config = UncertaintyConfig(
-        wind_buses=(1, 4),
-        wind_rated_mw=(100.0, 100.0),
+        B_w=(1, 4),
+        p_w_rated_mw=(100.0, 100.0),
     )
 
     validate_uncertainty_config(net, config)
@@ -354,9 +354,9 @@ if __name__ == "__main__":
 
     apply_wind_output(
         net=net,
-        wind_buses=config.wind_buses,
-        wind_scale=scenario.wind_scale,
-        wind_rated_mw=config.wind_rated_mw,
+        B_w=config.B_w,
+        p_w_scale=scenario.p_w_scale,
+        p_w_rated_mw=config.p_w_rated_mw,
     )
 
     state = scenario_to_state(

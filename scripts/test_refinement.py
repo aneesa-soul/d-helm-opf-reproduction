@@ -55,13 +55,13 @@ def test_r1(agent, states, a0, out0) -> None:
     feas0 = viol0 <= TOL
     assert feas0.any() and (~feas0).any(), "test set needs both kinds"
 
-    r = refine_actions(agent.critic, agent.cpo.lambdas, states, a0,
-                       RefineConfig(mode="r1", steps=50))
+    r = refine_actions(agent.critic, agent.cpo.lam, states, a0,
+                       RefineConfig(mode="r1", K=50))
     viol = r.z.sum(dim=1)
 
-    assert torch.all(r.actions.abs() <= 1.0)
+    assert torch.all(r.a_hat.abs() <= 1.0)
     assert torch.equal(r.refined, ~feas0)
-    assert torch.equal(r.actions[feas0], a0[feas0])          # untouched
+    assert torch.equal(r.a_hat[feas0], a0[feas0])          # untouched
     assert torch.all(viol <= viol0 + 1e-12)                  # never worse
 
     fixed = (viol[~feas0] <= TOL).double().mean().item()
@@ -74,24 +74,24 @@ def test_r1(agent, states, a0, out0) -> None:
 
 def test_r2(agent, states, a0, out0) -> None:
 
-    cost0 = out0.cost
+    cost0 = out0.f_sum
     viol0 = out0.z.sum(dim=1)
     feas0 = viol0 <= TOL
 
-    r = refine_actions(agent.critic, agent.cpo.lambdas, states, a0,
-                       RefineConfig(mode="r2", steps=50))
+    r = refine_actions(agent.critic, agent.cpo.lam, states, a0,
+                       RefineConfig(mode="r2", K=50))
     viol = r.z.sum(dim=1)
 
-    assert torch.all(r.actions.abs() <= 1.0)
+    assert torch.all(r.a_hat.abs() <= 1.0)
     assert bool(r.refined.all())
 
     # Feasible states stay feasible and do not get more expensive.
     assert bool((viol[feas0] <= TOL).all())
-    assert torch.all(r.cost[feas0] <= cost0[feas0] + 1e-9)
+    assert torch.all(r.f_sum[feas0] <= cost0[feas0] + 1e-9)
     # Infeasible states: violation never increases.
     assert torch.all(viol[~feas0] <= viol0[~feas0] + 1e-12)
 
-    saving = (1 - r.cost[feas0].mean() / cost0[feas0].mean()).item()
+    saving = (1 - r.f_sum[feas0].mean() / cost0[feas0].mean()).item()
     assert saving > 0.0, saving
 
     print(f"  3. R2: all {len(states)} states refined; feasible states "

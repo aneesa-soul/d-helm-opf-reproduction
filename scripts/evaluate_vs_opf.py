@@ -16,7 +16,7 @@ Reported: feasibility (sum z <= 1e-6), optimality gap
 Examples:
     python scripts/evaluate_vs_opf.py results/runs/case5_L1_ep100
     python scripts/evaluate_vs_opf.py results/runs/case5_L1_ep100 --checkpoint last
-    python scripts/evaluate_vs_opf.py results/runs/case5_L1_ep100 --refine r2 --refine-steps 50
+    python scripts/evaluate_vs_opf.py results/runs/case5_L1_ep100 --refine r2 --refine-K 50
 """
 
 from __future__ import annotations
@@ -47,7 +47,8 @@ def main() -> None:
     p.add_argument("run_dir")
     p.add_argument("--checkpoint", choices=("best", "last"), default="best")
     p.add_argument("--refine", choices=("none", "r1", "r2"), default="none")
-    p.add_argument("--refine-steps", type=int, default=20)
+    p.add_argument("--refine-K", type=int, default=20,
+                   help="refinement step budget K")
     p.add_argument("--refine-lr", type=float, default=0.03)
     p.add_argument("--n-states", type=int, default=100)
     p.add_argument("--seed", type=int, default=TEST_SEED)
@@ -70,7 +71,7 @@ def main() -> None:
 
     refine = None
     if args.refine != "none":
-        refine = RefineConfig(mode=args.refine, steps=args.refine_steps,
+        refine = RefineConfig(mode=args.refine, K=args.refine_K,
                               lr=args.refine_lr)
 
     result = evaluate_policy(agent, states, window, ref, refine)
@@ -79,7 +80,7 @@ def main() -> None:
     def pct(x):
         return f"{100 * x:+.2f}%"
 
-    label = args.refine if refine is None else f"{args.refine} (K={args.refine_steps})"
+    label = args.refine if refine is None else f"{args.refine} (K={args.refine_K})"
 
     print("=" * 68)
     print(f"{run_dir.name}  |  checkpoint {args.checkpoint} "
@@ -118,7 +119,7 @@ def main() -> None:
 
     tag = f"{args.checkpoint}_{args.refine}"
     if refine is not None:
-        tag += f"_K{args.refine_steps}"
+        tag += f"_K{args.refine_K}"
     if args.fixed_slack_voltage:
         tag += "_fixed_slack"
 

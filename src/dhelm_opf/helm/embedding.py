@@ -7,6 +7,13 @@ coefficient recursion.
 The representation keeps the network equations separate from the
 reinforcement-learning layer.  This allows the HELM solution to be
 validated independently against a conventional AC power-flow solution.
+
+Notation follows the paper (see NOTATION.md):
+
+    Y          bus admittance matrix
+    e_sp       specified complex injection e_i^sp = p_i + j q_i  (Eq. 8)
+    v_sp       voltage-magnitude setpoints |v_i|^sp
+    B_s        slack bus;  B_v PV buses;  B_q PQ buses
 """
 
 from __future__ import annotations
@@ -23,84 +30,86 @@ class HelmProblem:
 
     Parameters
     ----------
-    ybus:
-        Complex bus-admittance matrix.
+    Y:
+        Complex bus-admittance matrix Y_ij.
 
-    s_spec:
-        Complex specified net power injection at each bus.
+    e_sp:
+        Specified complex net power injection e_i^sp = p_i + j q_i at
+        each bus (Eq. 8).
 
         Positive P/Q means net injection into the network.
         Negative P/Q means net demand.
 
-    v_slack:
-        Complex voltage of the reference/slack bus.
+    v_s:
+        Complex voltage of the slack bus (|v_i|^sp at angle 0 in the
+        paper).
 
-    slack_bus:
-        Index of the reference/slack bus.
+    B_s:
+        Index of the slack bus.
 
-    pv_buses:
+    B_v:
         Indices of PV buses.
 
-    pq_buses:
+    B_q:
         Indices of PQ buses.
 
-    voltage_setpoints:
-        Specified voltage magnitudes for buses where a voltage
-        magnitude is prescribed.  Entries may be NaN for buses
-        without a specified voltage magnitude.
+    v_sp:
+        Specified voltage magnitudes |v_i|^sp for buses where a voltage
+        magnitude is prescribed.  Entries may be NaN for buses without
+        a specified voltage magnitude.
     """
 
-    ybus: np.ndarray
-    s_spec: np.ndarray
-    v_slack: complex
-    slack_bus: int
+    Y: np.ndarray
+    e_sp: np.ndarray
+    v_s: complex
+    B_s: int
 
-    pv_buses: tuple[int, ...] = ()
-    pq_buses: tuple[int, ...] = ()
-    voltage_setpoints: np.ndarray | None = None
+    B_v: tuple[int, ...] = ()
+    B_q: tuple[int, ...] = ()
+    v_sp: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         """Validate the HELM problem dimensions and bus types."""
 
-        self.ybus = np.asarray(
-            self.ybus,
+        self.Y = np.asarray(
+            self.Y,
             dtype=np.complex128,
         )
 
-        self.s_spec = np.asarray(
-            self.s_spec,
+        self.e_sp = np.asarray(
+            self.e_sp,
             dtype=np.complex128,
         )
 
-        if self.ybus.ndim != 2:
+        if self.Y.ndim != 2:
             raise ValueError(
-                "Ybus must be a two-dimensional matrix."
+                "Y must be a two-dimensional matrix."
             )
 
-        if self.ybus.shape[0] != self.ybus.shape[1]:
+        if self.Y.shape[0] != self.Y.shape[1]:
             raise ValueError(
-                "Ybus must be square."
+                "Y must be square."
             )
 
-        n_bus = self.ybus.shape[0]
+        n_bus = self.Y.shape[0]
 
-        if self.s_spec.shape != (n_bus,):
+        if self.e_sp.shape != (n_bus,):
             raise ValueError(
-                "s_spec must contain exactly one value per bus."
+                "e_sp must contain exactly one value per bus."
             )
 
-        if not 0 <= self.slack_bus < n_bus:
+        if not 0 <= self.B_s < n_bus:
             raise ValueError(
-                f"Invalid slack bus {self.slack_bus} "
+                f"Invalid slack bus {self.B_s} "
                 f"for a {n_bus}-bus system."
             )
 
         # Convert bus collections to immutable integer tuples.
-        self.pv_buses = tuple(int(bus) for bus in self.pv_buses)
-        self.pq_buses = tuple(int(bus) for bus in self.pq_buses)
+        self.B_v = tuple(int(bus) for bus in self.B_v)
+        self.B_q = tuple(int(bus) for bus in self.B_q)
 
         # Validate PV bus indices.
-        for bus in self.pv_buses:
+        for bus in self.B_v:
             if not 0 <= bus < n_bus:
                 raise ValueError(
                     f"Invalid PV bus {bus} "
@@ -108,130 +117,122 @@ class HelmProblem:
                 )
 
         # Validate PQ bus indices.
-        for bus in self.pq_buses:
+        for bus in self.B_q:
             if not 0 <= bus < n_bus:
                 raise ValueError(
                     f"Invalid PQ bus {bus} "
                     f"for a {n_bus}-bus system."
                 )
 
-        if self.slack_bus in self.pv_buses:
+        if self.B_s in self.B_v:
             raise ValueError(
                 "The slack bus must not also be listed as a PV bus."
             )
 
-        if self.slack_bus in self.pq_buses:
+        if self.B_s in self.B_q:
             raise ValueError(
                 "The slack bus must not also be listed as a PQ bus."
             )
 
-        if set(self.pv_buses) & set(self.pq_buses):
+        if set(self.B_v) & set(self.B_q):
             raise ValueError(
                 "A bus cannot simultaneously be PV and PQ."
             )
 
         # If voltage setpoints are not supplied, create an array
         # containing NaN for every bus.
-        if self.voltage_setpoints is None:
-            self.voltage_setpoints = np.full(
+        if self.v_sp is None:
+            self.v_sp = np.full(
                 n_bus,
                 np.nan,
                 dtype=float,
             )
         else:
-            self.voltage_setpoints = np.asarray(
-                self.voltage_setpoints,
+            self.v_sp = np.asarray(
+                self.v_sp,
                 dtype=float,
             )
 
-            if self.voltage_setpoints.shape != (n_bus,):
+            if self.v_sp.shape != (n_bus,):
                 raise ValueError(
-                    "voltage_setpoints must contain exactly "
+                    "v_sp must contain exactly "
                     "one value per bus."
                 )
 
         # The slack voltage magnitude is always known.
-        self.voltage_setpoints[self.slack_bus] = abs(
-            self.v_slack
+        self.v_sp[self.B_s] = abs(
+            self.v_s
         )
 
 
 def make_helm_problem(
-    ybus: np.ndarray,
-    s_spec: np.ndarray,
-    slack_bus: int,
-    v_slack: complex = 1.0 + 0.0j,
-    pv_buses: tuple[int, ...] = (),
-    pq_buses: tuple[int, ...] = (),
-    voltage_setpoints: np.ndarray | None = None,
+    Y: np.ndarray,
+    e_sp: np.ndarray,
+    B_s: int,
+    v_s: complex = 1.0 + 0.0j,
+    B_v: tuple[int, ...] = (),
+    B_q: tuple[int, ...] = (),
+    v_sp: np.ndarray | None = None,
 ) -> HelmProblem:
     """
     Construct a validated HELM problem.
     """
 
     return HelmProblem(
-        ybus=ybus,
-        s_spec=s_spec,
-        v_slack=v_slack,
-        slack_bus=slack_bus,
-        pv_buses=pv_buses,
-        pq_buses=pq_buses,
-        voltage_setpoints=voltage_setpoints,
+        Y=Y,
+        e_sp=e_sp,
+        v_s=v_s,
+        B_s=B_s,
+        B_v=B_v,
+        B_q=B_q,
+        v_sp=v_sp,
     )
 
 
 def power_injection_from_voltage(
-    ybus: np.ndarray,
-    voltage: np.ndarray,
+    Y: np.ndarray,
+    v: np.ndarray,
 ) -> np.ndarray:
     """
-    Calculate complex bus power injections.
+    Calculate the complex bus power injections e (Eq. 8, Algorithm 1):
 
-    The AC relationship is
-
-        I = Y V
-
-    and
-
-        S = V * conjugate(I).
+        e_i = v_i * sum_j conj(Y_ij) conj(v_j) = v * conj(Y v)
     """
 
-    ybus = np.asarray(
-        ybus,
+    Y = np.asarray(
+        Y,
         dtype=np.complex128,
     )
 
-    voltage = np.asarray(
-        voltage,
+    v = np.asarray(
+        v,
         dtype=np.complex128,
     )
 
-    current = ybus @ voltage
-
-    return voltage * np.conjugate(current)
+    return v * np.conjugate(Y @ v)
 
 
 def voltage_magnitudes(
-    voltage: np.ndarray,
+    v: np.ndarray,
 ) -> np.ndarray:
-    """Return voltage magnitudes."""
+    """Return |v_i|."""
 
     return np.abs(
         np.asarray(
-            voltage,
+            v,
             dtype=np.complex128,
         )
     )
 
 
 def voltage_angles(
-    voltage: np.ndarray,
+    v: np.ndarray,
 ) -> np.ndarray:
-    """Return voltage phase angles in radians."""
+    """Return theta_i (radians)."""
 
     return np.angle(
         np.asarray(
-            voltage,
+            v,
             dtype=np.complex128,
         )
     )

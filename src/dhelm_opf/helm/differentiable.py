@@ -2,9 +2,9 @@
 Differentiable, batched D-HELM in PyTorch.
 
 This is the differentiable counterpart of the NumPy reference solver in
-recursion.py / solver.py.  It evaluates the same embedding (Eqs. 11-13
-of the paper) for a whole minibatch of (state, action) pairs, so that
-the policy gradient can flow from the bus voltages back to the action.
+recursion.py / solver.py.  It evaluates the same embedding (Eqs. 9-13
+of the paper) for a whole minibatch of (s, a_hat) pairs, so that the
+policy gradient can flow from the bus voltages back to the action.
 
 Paper basis
 -----------
@@ -18,6 +18,9 @@ Sec. 3.2.2 and Eq. (17):
 
 with A decomposed once (LU) for all coefficients and samples, and N the
 number of terms after Algorithm 1 has converged (Eq. 14).
+
+Notation follows the paper (see NOTATION.md).  Complex quantities are
+carried as real and imaginary parts (suffixes _re, _im).
 
 Implementation choices
 ----------------------
@@ -52,7 +55,7 @@ from dhelm_opf.environment.uncertainty import (
     WIND_SGEN_TYPE,
 )
 from dhelm_opf.helm.problem import build_helm_problem_from_network
-from dhelm_opf.helm.recursion import build_coefficient_matrix
+from dhelm_opf.helm.recursion import build_A
 from dhelm_opf.helm.solver import HelmSolverConfig
 from dhelm_opf.models.action_config import ActionConfig
 
@@ -65,18 +68,17 @@ class DHelmSpecs:
     """
     Per-sample specified quantities (Eq. 17, step 1), all in p.u.
 
-    p_spec, q_spec : (B, n_bus)  net specified injections
-                                 (q_spec is only used at PQ buses)
-    v_sp           : (B, n_bus)  voltage-magnitude setpoints
-                                 (only PV and slack entries are used)
-    p_gen          : (B, n_gen)  active power of the controllable
-                                 non-slack units, in ActionConfig order
+    p, q  : (B, n_bus)  specified net injection e^sp = p + j q (Eq. 8);
+                        q is only used at PQ buses
+    v_sp  : (B, n_bus)  |v_i|^sp (only B_v and B_s entries are used)
+    p_g   : (B, n_g)    p_g of the non-slack units G_ns, in ActionConfig
+                        order
     """
 
-    p_spec: torch.Tensor
-    q_spec: torch.Tensor
+    p: torch.Tensor
+    q: torch.Tensor
     v_sp: torch.Tensor
-    p_gen: torch.Tensor
+    p_g: torch.Tensor
 
 
 @dataclass
@@ -85,21 +87,21 @@ class DHelmOutput:
     Result of one batched D-HELM evaluation.
 
     All tensors carry gradients with respect to the inputs except
-    `mismatch`, `converged` and `n_terms`.
+    `mismatch`, `converged` and `N`.
     """
 
-    v_re: torch.Tensor          # (B, n_bus)
-    v_im: torch.Tensor          # (B, n_bus)
-    v_mag: torch.Tensor         # (B, n_bus)
+    v_re: torch.Tensor          # (B, n_bus)  Re(v_i),  v = sum_n V_n
+    v_im: torch.Tensor          # (B, n_bus)  Im(v_i)
+    v_abs: torch.Tensor         # (B, n_bus)  |v_i|
 
-    e_re: torch.Tensor          # (B, n_bus)  P injection, p.u.
-    e_im: torch.Tensor          # (B, n_bus)  Q injection, p.u.
+    e_re: torch.Tensor          # (B, n_bus)  Re(e_i) = p_i, p.u.
+    e_im: torch.Tensor          # (B, n_bus)  Im(e_i) = q_i, p.u.
 
-    q_pv: torch.Tensor          # (B, n_pv)   sum_n Q_n at PV buses
+    q_v: torch.Tensor           # (B, |B_v|)  sum_n Q_{i,n}, i in B_v
 
     specs: DHelmSpecs
 
-    n_terms: int
+    N: int                      # series terms used
     mismatch: torch.Tensor      # (B,)  Eq. (14) mismatch, no grad
     converged: torch.Tensor     # (B,)  bool
 
@@ -109,8 +111,8 @@ class DHelmNetwork(torch.nn.Module):
     Constant network data and the batched D-HELM recursion.
 
     Everything that does not depend on the action or the state is built
-    once here: Ybus, the Y^tr / Y^sh split, A and its LU factors, bus
-    index sets, and the incidence matrices that map generators, wind and
+    once here: Y, the Y_tr / Y_sh split, A and its LU factors, bus
+    index sets, and the incidence matrices that map units, wind and
     loads onto buses.
 
     Parameters
@@ -121,9 +123,9 @@ class DHelmNetwork(torch.nn.Module):
     action_config:
         Action layout derived from the same network.
     uncertainty_config:
-        Wind buses / ratings and the state layout.
+        Wind buses B_w / ratings and the state layout.
     solver_config:
-        n_max, tolerance and min_order.  Defaults follow Algorithm 1.
+        n_max, epsilon and n_min.  Defaults follow Algorithm 1.
     """
 
     def __init__(
@@ -144,7 +146,7 @@ class DHelmNetwork(torch.nn.Module):
         net = copy.deepcopy(net)
 
         # ------------------------------------------------------------
-        # Ybus / bus types from the same path the NumPy solver uses.
+        # Y / bus types from the same path the NumPy solver uses.
         # ------------------------------------------------------------
         pp.runpp(net)
 
@@ -161,21 +163,19 @@ class DHelmNetwork(torch.nn.Module):
             )
 
         problem = build_helm_problem_from_network(net)
-        A, _, y_sh = build_coefficient_matrix(problem)
+        A, _, Y_sh = build_A(problem)
 
-        n_bus = problem.ybus.shape[0]
+        n_bus = problem.Y.shape[0]
 
         self.n_bus = n_bus
-        self.slack = problem.slack_bus
-        self.pv = list(problem.pv_buses)
-        self.pq = list(problem.pq_buses)
-        self.n_pv = len(self.pv)
+        self.B_s = problem.B_s
+        self.B_v = list(problem.B_v)
+        self.B_q = list(problem.B_q)
 
-        expected_pv = sorted(
-            b for b in action_config.voltage_buses
-            if b != action_config.slack.bus
-        )
-        if sorted(self.pv) != expected_pv or self.slack != action_config.slack.bus:
+        cfg = action_config
+
+        expected_B_v = sorted(b for b in cfg.B_vs if b != cfg.G_s.bus)
+        if sorted(self.B_v) != expected_B_v or self.B_s != cfg.G_s.bus:
             raise ValueError(
                 "ActionConfig voltage buses do not match the network's "
                 "PV / slack buses."
@@ -186,42 +186,49 @@ class DHelmNetwork(torch.nn.Module):
             # which torch.as_tensor would otherwise share (UserWarning).
             return torch.tensor(np.array(x, dtype=float), dtype=DTYPE, device=device)
 
-        LU, pivots = torch.linalg.lu_factor(t(A))
-        self.register_buffer("LU", LU)
-        self.register_buffer("pivots", pivots)
+        # A is decomposed once for all coefficients and samples (Eq. 12).
+        A_LU, A_piv = torch.linalg.lu_factor(t(A))
+        self.register_buffer("A_LU", A_LU)
+        self.register_buffer("A_piv", A_piv)
 
-        self.register_buffer("ysh_g", t(np.real(y_sh)))
-        self.register_buffer("ysh_b", t(np.imag(y_sh)))
-        self.register_buffer("Y_g", t(np.real(problem.ybus)))
-        self.register_buffer("Y_b", t(np.imag(problem.ybus)))
+        self.register_buffer("Y_sh_re", t(np.real(Y_sh)))
+        self.register_buffer("Y_sh_im", t(np.imag(Y_sh)))
+        self.register_buffer("Y_re", t(np.real(problem.Y)))
+        self.register_buffer("Y_im", t(np.imag(problem.Y)))
 
         base = float(net.sn_mva)
         self.base_mva = base
 
         # ------------------------------------------------------------
-        # Action scaling (same linear map as ActionDecoder)
+        # Eq. (18) bounds a_min, a_max in action order
+        # (|v| in p.u., p_g in p.u.), same map as ActionDecoder.
         # ------------------------------------------------------------
-        cfg = action_config
+        self.n_v = cfg.n_v
+        self.n_g = cfg.n_g
 
-        self.register_buffer("v_lo", t(cfg.voltage_min))
-        self.register_buffer("v_hi", t(cfg.voltage_max))
-        self.register_buffer("p_lo", t(cfg.generator_p_min_mw / base))
-        self.register_buffer("p_hi", t(cfg.generator_p_max_mw / base))
+        self.register_buffer(
+            "a_min", t(np.concatenate([cfg.v_min, cfg.P_min / base]))
+        )
+        self.register_buffer(
+            "a_max", t(np.concatenate([cfg.v_max, cfg.P_max / base]))
+        )
 
-        v_map = np.zeros((cfg.n_voltage, n_bus))
-        for k, bus in enumerate(cfg.voltage_buses):
-            v_map[k, bus] = 1.0
-        self.register_buffer("V_map", t(v_map))
+        # Voltage actions -> buses.
+        C_v = np.zeros((cfg.n_v, n_bus))
+        for k, bus in enumerate(cfg.B_vs):
+            C_v[k, bus] = 1.0
+        self.register_buffer("C_v", t(C_v))
 
-        # Generator -> bus, including sgen `scaling` (as in build_sbus).
-        c_gen = np.zeros((cfg.n_generator, n_bus))
-        for k, unit in enumerate(cfg.generators):
+        # Units G_ns -> buses (G_i of Eq. 8), including sgen `scaling`
+        # (as in build_e_sp).
+        C_g = np.zeros((cfg.n_g, n_bus))
+        for k, unit in enumerate(cfg.G_ns):
             scaling = (
                 float(net.sgen.at[unit.index, "scaling"])
                 if unit.table == "sgen" else 1.0
             )
-            c_gen[k, unit.bus] = scaling
-        self.register_buffer("C_gen", t(c_gen))
+            C_g[k, unit.bus] = scaling
+        self.register_buffer("C_g", t(C_g))
 
         # ------------------------------------------------------------
         # Fixed injections: every in-service sgen that is neither a
@@ -229,7 +236,7 @@ class DHelmNetwork(torch.nn.Module):
         # controllable sgens.  Gen Q is never fixed (solved by HELM).
         # ------------------------------------------------------------
         controlled_sgens = {
-            u.index for u in cfg.generators if u.table == "sgen"
+            u.index for u in cfg.G_ns if u.table == "sgen"
         }
 
         p_fix = np.zeros(n_bus)
@@ -253,40 +260,42 @@ class DHelmNetwork(torch.nn.Module):
         self.register_buffer("q_fix", t(q_fix))
 
         # ------------------------------------------------------------
-        # Loads and wind (the state vector)
+        # Demand and wind (the state s, Eq. 2)
         #
-        # state = [p_d scale (n_load), q_d scale (n_load), wind scale (n_w)]
+        # s = [p_d scale (n_d), q_d scale (n_d), p_w scale (n_w)]
         # ------------------------------------------------------------
         loads = net.load[net.load["in_service"]]
-        n_load = len(loads)
+        n_d = len(loads)
 
-        c_load = np.zeros((n_load, n_bus))
+        C_d = np.zeros((n_d, n_bus))
         for k, bus in enumerate(loads["bus"].astype(int)):
-            c_load[k, bus] = 1.0
+            C_d[k, bus] = 1.0
 
-        self.register_buffer("C_load", t(c_load))
-        self.register_buffer("p_load_nom", t(loads["p_mw"].to_numpy() / base))
-        self.register_buffer("q_load_nom", t(loads["q_mvar"].to_numpy() / base))
+        self.register_buffer("C_d", t(C_d))
+        self.register_buffer("p_d_nom", t(loads["p_mw"].to_numpy() / base))
+        self.register_buffer("q_d_nom", t(loads["q_mvar"].to_numpy() / base))
 
-        wind_buses = self.uncertainty_config.wind_buses
-        wind_rated = self.uncertainty_config.wind_rated_mw
+        B_w = self.uncertainty_config.B_w
+        p_w_rated = self.uncertainty_config.p_w_rated_mw
 
-        c_wind = np.zeros((len(wind_buses), n_bus))
-        for k, bus in enumerate(wind_buses):
-            c_wind[k, bus] = 1.0
+        C_w = np.zeros((len(B_w), n_bus))
+        for k, bus in enumerate(B_w):
+            C_w[k, bus] = 1.0
 
-        self.register_buffer("C_wind", t(c_wind))
-        self.register_buffer("wind_rated", t(np.asarray(wind_rated) / base))
+        self.register_buffer("C_w", t(C_w))
+        self.register_buffer("p_w_rated", t(np.asarray(p_w_rated) / base))
 
-        self.n_load = n_load
-        self.n_wind = len(wind_buses)
-        self.state_dim = 2 * n_load + self.n_wind
+        self.n_d = n_d
+        self.n_w = len(B_w)
+        self.state_dim = 2 * n_d + self.n_w
         self.action_dim = cfg.action_dim
 
-        pq = torch.as_tensor(self.pq, dtype=torch.long, device=device)
-        pv = torch.as_tensor(self.pv, dtype=torch.long, device=device)
-        self.register_buffer("pq_idx", pq)
-        self.register_buffer("pv_idx", pv)
+        self.register_buffer(
+            "B_q_idx", torch.as_tensor(self.B_q, dtype=torch.long, device=device)
+        )
+        self.register_buffer(
+            "B_v_idx", torch.as_tensor(self.B_v, dtype=torch.long, device=device)
+        )
 
     # ------------------------------------------------------------------
     # Eq. (17), step 1: linear assignment
@@ -294,71 +303,73 @@ class DHelmNetwork(torch.nn.Module):
 
     def specs(
         self,
-        state: torch.Tensor,
-        action: torch.Tensor,
+        s: torch.Tensor,
+        a_hat: torch.Tensor,
     ) -> DHelmSpecs:
         """
-        Map (state, normalized action) to specified injections and
-        voltage setpoints, in p.u.
+        Map (s, a_hat) to the specified injections and voltage
+        setpoints, in p.u.
+
+        Eq. (18):  a = a_min + (a_max - a_min) (a_hat + 1) / 2
+        Eq. (8):   p_i = sum_{g in G_i} p_g + p_i^w - p_i^d,  q_i = -q_i^d
         """
 
-        state = state.to(DTYPE)
-        action = action.to(DTYPE)
+        s = s.to(DTYPE)
+        a_hat = a_hat.to(DTYPE)
 
-        if state.shape[-1] != self.state_dim:
+        if s.shape[-1] != self.state_dim:
             raise ValueError(
                 f"Expected state dimension {self.state_dim}, "
-                f"got {state.shape[-1]}."
+                f"got {s.shape[-1]}."
             )
-        if action.shape[-1] != self.action_dim:
+        if a_hat.shape[-1] != self.action_dim:
             raise ValueError(
                 f"Expected action dimension {self.action_dim}, "
-                f"got {action.shape[-1]}."
+                f"got {a_hat.shape[-1]}."
             )
 
-        n_load, n_wind = self.n_load, self.n_wind
-        n_v = self.action_config.n_voltage
+        n_d, n_w, n_v = self.n_d, self.n_w, self.n_v
 
-        p_scale = state[:, :n_load]
-        q_scale = state[:, n_load:2 * n_load]
-        w_scale = state[:, 2 * n_load:2 * n_load + n_wind]
+        p_d_scale = s[:, :n_d]
+        q_d_scale = s[:, n_d:2 * n_d]
+        p_w_scale = s[:, 2 * n_d:2 * n_d + n_w]
 
-        a_v = action[:, :n_v]
-        a_p = action[:, n_v:]
+        # Eq. (18)
+        a = self.a_min + 0.5 * (a_hat + 1.0) * (self.a_max - self.a_min)
 
-        v_set = self.v_lo + 0.5 * (a_v + 1.0) * (self.v_hi - self.v_lo)
-        p_gen = self.p_lo + 0.5 * (a_p + 1.0) * (self.p_hi - self.p_lo)
+        v_set = a[:, :n_v]
+        p_g = a[:, n_v:]
 
-        p_spec = (
-            p_gen @ self.C_gen
-            + (w_scale * self.wind_rated) @ self.C_wind
-            - (p_scale * self.p_load_nom) @ self.C_load
+        p = (
+            p_g @ self.C_g
+            + (p_w_scale * self.p_w_rated) @ self.C_w
+            - (p_d_scale * self.p_d_nom) @ self.C_d
             + self.p_fix
         )
 
-        q_spec = (
-            - (q_scale * self.q_load_nom) @ self.C_load
+        q = (
+            - (q_d_scale * self.q_d_nom) @ self.C_d
             + self.q_fix
         )
 
-        v_sp = v_set @ self.V_map
+        v_sp = v_set @ self.C_v
 
         return DHelmSpecs(
-            p_spec=p_spec,
-            q_spec=q_spec,
+            p=p,
+            q=q,
             v_sp=v_sp,
-            p_gen=p_gen,
+            p_g=p_g,
         )
 
     # ------------------------------------------------------------------
     # Helpers in real arithmetic
     # ------------------------------------------------------------------
 
-    def injections(self, v_re, v_im):
-        """e = v * conj(Y v) with the full Ybus (real / imag parts)."""
+    def compute_e(self, v_re, v_im):
+        """e = v * conj(Y v) with the full Y (Algorithm 1, step 3)."""
 
-        i_re = v_re @ self.Y_g.T - v_im @ self.Y_b.T
-        i_im = v_im @ self.Y_g.T + v_re @ self.Y_b.T
+        i_re = v_re @ self.Y_re.T - v_im @ self.Y_im.T
+        i_im = v_im @ self.Y_re.T + v_re @ self.Y_im.T
 
         e_re = v_re * i_re + v_im * i_im
         e_im = v_im * i_re - v_re * i_im
@@ -368,21 +379,21 @@ class DHelmNetwork(torch.nn.Module):
     def eq14_mismatch(self, v_re, v_im, specs: DHelmSpecs) -> torch.Tensor:
         """Per-sample max of the Eq. (14a)-(14c) mismatches."""
 
-        e_re, e_im = self.injections(v_re, v_im)
+        e_re, e_im = self.compute_e(v_re, v_im)
 
-        pq, pv = self.pq_idx, self.pv_idx
+        B_q, B_v = self.B_q_idx, self.B_v_idx
 
-        pq_err = torch.sqrt(
-            (e_re[:, pq] - specs.p_spec[:, pq]) ** 2
-            + (e_im[:, pq] - specs.q_spec[:, pq]) ** 2
+        err_14b = torch.sqrt(
+            (e_re[:, B_q] - specs.p[:, B_q]) ** 2
+            + (e_im[:, B_q] - specs.q[:, B_q]) ** 2
         )
-        v_mag = torch.sqrt(v_re[:, pv] ** 2 + v_im[:, pv] ** 2)
-        pv_v_err = torch.abs(v_mag - specs.v_sp[:, pv])
-        pv_p_err = torch.abs(e_re[:, pv] - specs.p_spec[:, pv])
+        v_abs_v = torch.sqrt(v_re[:, B_v] ** 2 + v_im[:, B_v] ** 2)
+        err_14a = torch.abs(v_abs_v - specs.v_sp[:, B_v])
+        err_14c = torch.abs(e_re[:, B_v] - specs.p[:, B_v])
 
-        parts = [pv_v_err, pv_p_err]
-        if len(self.pq) > 0:
-            parts.append(pq_err)
+        parts = [err_14a, err_14c]
+        if len(self.B_q) > 0:
+            parts.append(err_14b)
 
         return torch.cat(parts, dim=1).amax(dim=1)
 
@@ -392,157 +403,159 @@ class DHelmNetwork(torch.nn.Module):
 
     def forward(
         self,
-        state: torch.Tensor,
-        action: torch.Tensor,
-        n_terms: int | None = None,
+        s: torch.Tensor,
+        a_hat: torch.Tensor,
+        N: int | None = None,
     ) -> DHelmOutput:
         """
         Evaluate D-HELM for a batch.
 
         Parameters
         ----------
-        state:  (B, state_dim)  demand / wind scaling factors
-        action: (B, action_dim) normalized policy action in [-1, 1]
-        n_terms:
-            If given, compute exactly this many terms (no early stop).
-            Used for exact comparison with the NumPy solver and for
-            gradcheck.  If None, stop per Algorithm 1 / Eq. (14).
+        s:      (B, state_dim)   state (demand / wind scaling factors)
+        a_hat:  (B, action_dim)  normalized action tanh(logit) in [-1, 1]
+        N:
+            If given, compute exactly N terms (no early stop).  Used for
+            exact comparison with the NumPy solver and for gradcheck.
+            If None, stop per Algorithm 1 / Eq. (14).
         """
 
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
-        if action.dim() == 1:
-            action = action.unsqueeze(0)
+        if s.dim() == 1:
+            s = s.unsqueeze(0)
+        if a_hat.dim() == 1:
+            a_hat = a_hat.unsqueeze(0)
 
-        specs = self.specs(state, action)
+        specs = self.specs(s, a_hat)
 
-        B = state.shape[0]
+        batch = s.shape[0]
         n_bus = self.n_bus
-        pq, pv, s = self.pq_idx, self.pv_idx, self.slack
+        B_q, B_v, B_s = self.B_q_idx, self.B_v_idx, self.B_s
+        n_bv = len(self.B_v)
 
         cfg = self.solver_config
-        max_order = n_terms if n_terms is not None else cfg.max_order
+        n_max = N if N is not None else cfg.n_max
 
-        P = specs.p_spec
-        Q_sp = specs.q_spec
+        p = specs.p
+        q = specs.q
+        dev = p.device
 
-        ones = torch.ones(B, n_bus, dtype=DTYPE, device=P.device)
-        zeros = torch.zeros(B, n_bus, dtype=DTYPE, device=P.device)
+        ones = torch.ones(batch, n_bus, dtype=DTYPE, device=dev)
+        zeros = torch.zeros(batch, n_bus, dtype=DTYPE, device=dev)
 
         # No-load germ: V_0 = 1, W_0 = 1, Q_0 = 0.
         V_re, V_im = [ones], [zeros]
         W_re, W_im = [ones], [zeros]
-        Qs = [torch.zeros(B, self.n_pv, dtype=DTYPE, device=P.device)]
+        Q = [torch.zeros(batch, n_bv, dtype=DTYPE, device=dev)]
 
-        v_re_sum, v_im_sum = ones, zeros
+        v_re, v_im = ones, zeros
 
         mismatch = None
-        converged = torch.zeros(B, dtype=torch.bool, device=P.device)
-        orders_used = 0
+        converged = torch.zeros(batch, dtype=torch.bool, device=dev)
+        N_used = 0
 
-        for n in range(1, max_order + 1):
+        for n in range(1, n_max + 1):
 
-            Wr, Wi = W_re[n - 1], W_im[n - 1]
-            Vr, Vi = V_re[n - 1], V_im[n - 1]
+            W_re_p, W_im_p = W_re[n - 1], W_im[n - 1]
+            V_re_p, V_im_p = V_re[n - 1], V_im[n - 1]
 
-            # Y^sh V_{n-1}
-            ysh_re = self.ysh_g * Vr - self.ysh_b * Vi
-            ysh_im = self.ysh_g * Vi + self.ysh_b * Vr
+            # Y_sh V_{n-1}
+            YshV_re = self.Y_sh_re * V_re_p - self.Y_sh_im * V_im_p
+            YshV_im = self.Y_sh_re * V_im_p + self.Y_sh_im * V_re_p
 
-            # ---- R_n, PQ buses: conj(S) conj(W_{n-1}) ----------------
-            r_re_pq = P[:, pq] * Wr[:, pq] - Q_sp[:, pq] * Wi[:, pq]
-            r_im_pq = -P[:, pq] * Wi[:, pq] - Q_sp[:, pq] * Wr[:, pq]
+            # ---- R_n, PQ buses: conj(e^sp) conj(W_{n-1}) -------------
+            R_re_q = p[:, B_q] * W_re_p[:, B_q] - q[:, B_q] * W_im_p[:, B_q]
+            R_im_q = -p[:, B_q] * W_im_p[:, B_q] - q[:, B_q] * W_re_p[:, B_q]
 
             # ---- R_n, PV buses:
             #      P conj(W_{n-1}) - j sum_m Q_m conj(W_{n-m}) ----------
-            r_re_pv = P[:, pv] * Wr[:, pv]
-            r_im_pv = -P[:, pv] * Wi[:, pv]
+            R_re_v = p[:, B_v] * W_re_p[:, B_v]
+            R_im_v = -p[:, B_v] * W_im_p[:, B_v]
 
             for m in range(1, n):
-                Qm = Qs[m]
-                r_re_pv = r_re_pv - Qm * W_im[n - m][:, pv]
-                r_im_pv = r_im_pv - Qm * W_re[n - m][:, pv]
+                Q_m = Q[m]
+                R_re_v = R_re_v - Q_m * W_im[n - m][:, B_v]
+                R_im_v = R_im_v - Q_m * W_re[n - m][:, B_v]
 
-            # Assemble R_n - Y^sh V_{n-1}, slack row separately.
-            b_re = torch.zeros(B, n_bus, dtype=DTYPE, device=P.device)
-            b_im = torch.zeros(B, n_bus, dtype=DTYPE, device=P.device)
+            # b_n = [Re, Im](R_n - Y_sh V_{n-1}), slack row separately.
+            b_re = torch.zeros(batch, n_bus, dtype=DTYPE, device=dev)
+            b_im = torch.zeros(batch, n_bus, dtype=DTYPE, device=dev)
 
-            b_re = b_re.index_copy(1, pq, r_re_pq - ysh_re[:, pq])
-            b_im = b_im.index_copy(1, pq, r_im_pq - ysh_im[:, pq])
-            b_re = b_re.index_copy(1, pv, r_re_pv - ysh_re[:, pv])
-            b_im = b_im.index_copy(1, pv, r_im_pv - ysh_im[:, pv])
+            b_re = b_re.index_copy(1, B_q, R_re_q - YshV_re[:, B_q])
+            b_im = b_im.index_copy(1, B_q, R_im_q - YshV_im[:, B_q])
+            b_re = b_re.index_copy(1, B_v, R_re_v - YshV_re[:, B_v])
+            b_im = b_im.index_copy(1, B_v, R_im_v - YshV_im[:, B_v])
 
             if n == 1:
-                slack_val = (specs.v_sp[:, s] - 1.0).unsqueeze(1)
+                R_s = (specs.v_sp[:, B_s] - 1.0).unsqueeze(1)
                 b_re = torch.cat(
-                    [b_re[:, :s], slack_val, b_re[:, s + 1:]], dim=1
+                    [b_re[:, :B_s], R_s, b_re[:, B_s + 1:]], dim=1
                 )
 
             # ---- U_n, PV voltage equations --------------------------
             if n == 1:
-                U = 0.5 * (specs.v_sp[:, pv] ** 2 - 1.0)
+                U_n = 0.5 * (specs.v_sp[:, B_v] ** 2 - 1.0)
             else:
-                acc = torch.zeros(B, self.n_pv, dtype=DTYPE, device=P.device)
+                acc = torch.zeros(batch, n_bv, dtype=DTYPE, device=dev)
                 for m in range(1, n):
                     acc = acc + (
-                        V_re[m][:, pv] * V_re[n - m][:, pv]
-                        + V_im[m][:, pv] * V_im[n - m][:, pv]
+                        V_re[m][:, B_v] * V_re[n - m][:, B_v]
+                        + V_im[m][:, B_v] * V_im[n - m][:, B_v]
                     )
-                U = -0.5 * acc
+                U_n = -0.5 * acc
 
-            b = torch.cat([b_re, b_im, U], dim=1)            # (B, 2n+m)
+            b_n = torch.cat([b_re, b_im, U_n], dim=1)        # (batch, 2|B|+|B_v|)
 
             # ---- x_n = A^{-1} b_n (one LU solve for the batch) -------
-            x = torch.linalg.lu_solve(self.LU, self.pivots, b.T).T
+            x_n = torch.linalg.lu_solve(self.A_LU, self.A_piv, b_n.T).T
 
-            Vr_n = x[:, :n_bus]
-            Vi_n = x[:, n_bus:2 * n_bus]
-            Q_n = x[:, 2 * n_bus:]
+            V_re_n = x_n[:, :n_bus]
+            V_im_n = x_n[:, n_bus:2 * n_bus]
+            Q_n = x_n[:, 2 * n_bus:]
 
-            V_re.append(Vr_n)
-            V_im.append(Vi_n)
-            Qs.append(Q_n)
+            V_re.append(V_re_n)
+            V_im.append(V_im_n)
+            Q.append(Q_n)
 
             # ---- Eq. (11): W_n = -sum_{m=1}^{n} V_m W_{n-m}  (V_0 = 1)
-            w_re = torch.zeros_like(Vr_n)
-            w_im = torch.zeros_like(Vr_n)
+            W_re_n = torch.zeros_like(V_re_n)
+            W_im_n = torch.zeros_like(V_re_n)
             for m in range(1, n + 1):
-                w_re = w_re - (V_re[m] * W_re[n - m] - V_im[m] * W_im[n - m])
-                w_im = w_im - (V_re[m] * W_im[n - m] + V_im[m] * W_re[n - m])
-            W_re.append(w_re)
-            W_im.append(w_im)
+                W_re_n = W_re_n - (V_re[m] * W_re[n - m] - V_im[m] * W_im[n - m])
+                W_im_n = W_im_n - (V_re[m] * W_im[n - m] + V_im[m] * W_re[n - m])
+            W_re.append(W_re_n)
+            W_im.append(W_im_n)
 
-            v_re_sum = v_re_sum + Vr_n
-            v_im_sum = v_im_sum + Vi_n
-            orders_used = n
+            v_re = v_re + V_re_n
+            v_im = v_im + V_im_n
+            N_used = n
 
             # ---- Algorithm 1, step 4: Eq. (14) check, outside graph --
             with torch.no_grad():
                 mismatch = self.eq14_mismatch(
-                    v_re_sum.detach(), v_im_sum.detach(), specs
+                    v_re.detach(), v_im.detach(), specs
                 )
-                converged = mismatch <= cfg.tolerance
+                converged = mismatch <= cfg.epsilon
 
             if (
-                n_terms is None
-                and n >= cfg.min_order
+                N is None
+                and n >= cfg.n_min
                 and bool(converged.all())
             ):
                 break
 
-        e_re, e_im = self.injections(v_re_sum, v_im_sum)
-        v_mag = torch.sqrt(v_re_sum ** 2 + v_im_sum ** 2)
-        q_pv = torch.stack(Qs, dim=0).sum(dim=0)
+        e_re, e_im = self.compute_e(v_re, v_im)
+        v_abs = torch.sqrt(v_re ** 2 + v_im ** 2)
+        q_v = torch.stack(Q, dim=0).sum(dim=0)
 
         return DHelmOutput(
-            v_re=v_re_sum,
-            v_im=v_im_sum,
-            v_mag=v_mag,
+            v_re=v_re,
+            v_im=v_im,
+            v_abs=v_abs,
             e_re=e_re,
             e_im=e_im,
-            q_pv=q_pv,
+            q_v=q_v,
             specs=specs,
-            n_terms=orders_used,
+            N=N_used,
             mismatch=mismatch,
             converged=converged,
         )

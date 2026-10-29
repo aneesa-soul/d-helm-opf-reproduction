@@ -1,23 +1,21 @@
 """
-Decode the normalized policy action into physical OPF setpoints.
+Decode the normalized policy action a_hat into the physical action a.
 
 Paper basis
 -----------
-Table 1: policy output = |B_v ∪ B_s| + |G / G_s|  (4 + 4 = 8 for 5-bus).
+Eq. (4):   a_t = (p_g, g in G / G_s;  |v_i|, i in B_v ∪ B_s)
+Eq. (18):  a = a_min + (a_max - a_min) (tanh(logit) + 1) / 2
+Table 1:   |B_v ∪ B_s| + |G / G_s| = 4 + 4 = 8 for 5-bus.
 
-The bounds are taken from the ActionConfig, which is derived from the
-network data (see action_config.action_config_from_network), so no
-limits are supplied or invented here.
+The policy outputs a_hat = tanh(logit) in [-1, 1]; this module applies
+the Eq. (18) map with the bounds of the ActionConfig, which is derived
+from the network data (see action_config.action_config_from_network),
+so no limits are supplied or invented here:
 
-Normalized action convention
-----------------------------
-Each policy output is in [-1, 1] and is mapped linearly to its physical
-range:
+    |v_i| : [-1, 1] -> [v_min, v_max]   (p.u.)
+    p_g   : [-1, 1] -> [P_min, P_max]   (MW)
 
-    voltage   : [-1, 1] -> [V_min, V_max]   (p.u.)
-    generator : [-1, 1] -> [P_min, P_max]   (MW)
-
-The policy's tanh / bound enforcement will be connected later.
+Notation follows the paper (see NOTATION.md).
 """
 
 from __future__ import annotations
@@ -34,44 +32,44 @@ from .action_config import ActionConfig
 @dataclass(frozen=True)
 class DecodedAction:
     """
-    Physical setpoints for one policy action.
+    Physical action a for one policy output.
 
-    voltage_setpoints[k]  belongs to config.voltage_buses[k]   (p.u.)
-    generator_p_mw[k]     belongs to config.generators[k]      (MW)
+    v_sp[k]  |v_i|^sp of bus config.B_vs[k]   (p.u.)
+    p_g[k]   p_g of unit config.G_ns[k]        (MW)
     """
 
-    voltage_setpoints: np.ndarray
-    generator_p_mw: np.ndarray
+    v_sp: np.ndarray
+    p_g: np.ndarray
     base_mva: float
 
     @property
-    def generator_p_pu(self) -> np.ndarray:
-        return self.generator_p_mw / self.base_mva
+    def p_g_pu(self) -> np.ndarray:
+        return self.p_g / self.base_mva
 
     @property
     def action_dim(self) -> int:
-        return len(self.voltage_setpoints) + len(self.generator_p_mw)
+        return len(self.v_sp) + len(self.p_g)
 
 
 class ActionDecoder:
-    """Convert normalized policy outputs into physical OPF setpoints."""
+    """Eq. (18): convert a_hat in [-1, 1] into the physical action a."""
 
     def __init__(self, config: ActionConfig) -> None:
 
         self.config = config
 
-        self._v_min = np.asarray(config.voltage_min, dtype=float)
-        self._v_max = np.asarray(config.voltage_max, dtype=float)
+        self._v_min = np.asarray(config.v_min, dtype=float)
+        self._v_max = np.asarray(config.v_max, dtype=float)
 
-        self._p_min = config.generator_p_min_mw
-        self._p_max = config.generator_p_max_mw
+        self._P_min = config.P_min
+        self._P_max = config.P_max
 
-    def _validate_normalized_action(
+    def _validate_a_hat(
         self,
-        action: Sequence[float],
+        a_hat: Sequence[float],
     ) -> np.ndarray:
 
-        values = np.asarray(action, dtype=float)
+        values = np.asarray(a_hat, dtype=float)
 
         if values.shape != (self.config.action_dim,):
             raise ValueError(
@@ -90,21 +88,21 @@ class ActionDecoder:
         return values
 
     @staticmethod
-    def _scale(value, lower, upper):
-        """Map [-1, 1] to [lower, upper] (element-wise)."""
+    def _scale(a_hat, a_min, a_max):
+        """Eq. (18): a = a_min + (a_max - a_min) (a_hat + 1) / 2."""
 
-        return lower + 0.5 * (value + 1.0) * (upper - lower)
+        return a_min + 0.5 * (a_hat + 1.0) * (a_max - a_min)
 
-    def decode(self, action: Sequence[float]) -> DecodedAction:
+    def decode(self, a_hat: Sequence[float]) -> DecodedAction:
 
-        action = self._validate_normalized_action(action)
+        a_hat = self._validate_a_hat(a_hat)
 
-        v_part = action[list(self.config.voltage_action_indices)]
-        p_part = action[list(self.config.generator_action_indices)]
+        a_hat_v = a_hat[list(self.config.voltage_action_indices)]
+        a_hat_p = a_hat[list(self.config.generator_action_indices)]
 
         return DecodedAction(
-            voltage_setpoints=self._scale(v_part, self._v_min, self._v_max),
-            generator_p_mw=self._scale(p_part, self._p_min, self._p_max),
+            v_sp=self._scale(a_hat_v, self._v_min, self._v_max),
+            p_g=self._scale(a_hat_p, self._P_min, self._P_max),
             base_mva=self.config.base_mva,
         )
 
@@ -115,24 +113,24 @@ def apply_action_to_network(
     decoded: DecodedAction,
 ) -> None:
     """
-    Write decoded setpoints into the pandapower network.
+    Write the physical action a into the pandapower network.
 
-    Voltage setpoints:
-        slack bus -> ext_grid.vm_pu
-        PV bus    -> vm_pu of every in-service gen on that bus
+    |v_i|^sp:
+        slack bus B_s -> ext_grid.vm_pu
+        PV bus in B_v -> vm_pu of every in-service gen on that bus
 
-    Generator setpoints:
+    p_g:
         p_mw of the corresponding gen / sgen row
 
     Used for validation against pandapower and to build HelmProblem
-    instances.  The training critic will take these values directly as
+    instances.  The training critic takes these values directly as
     tensors instead of going through pandapower.
     """
 
-    for bus, vm in zip(config.voltage_buses, decoded.voltage_setpoints):
+    for bus, v_sp_i in zip(config.B_vs, decoded.v_sp):
 
-        if bus == config.slack.bus:
-            net.ext_grid.at[config.slack.index, "vm_pu"] = float(vm)
+        if bus == config.G_s.bus:
+            net.ext_grid.at[config.G_s.index, "vm_pu"] = float(v_sp_i)
             continue
 
         on_bus = net.gen.index[
@@ -144,7 +142,7 @@ def apply_action_to_network(
                 f"No in-service gen regulates voltage bus {bus}."
             )
 
-        net.gen.loc[on_bus, "vm_pu"] = float(vm)
+        net.gen.loc[on_bus, "vm_pu"] = float(v_sp_i)
 
-    for unit, p_mw in zip(config.generators, decoded.generator_p_mw):
-        net[unit.table].at[unit.index, "p_mw"] = float(p_mw)
+    for unit, p_g in zip(config.G_ns, decoded.p_g):
+        net[unit.table].at[unit.index, "p_mw"] = float(p_g)

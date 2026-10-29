@@ -90,16 +90,16 @@ def test_gradient_flow(agent) -> None:
 def test_lambda_update() -> None:
 
     agent = make_case5_agent(
-        cpo_config=CPOConfig(eta_lambda=2.0, lambda_max=12.0)
+        cpo_config=CPOConfig(eta_lam=2.0, lam_max=12.0)
     )
     cpo = agent.cpo
-    n = len(cpo.lambdas)
+    n = len(cpo.lam)
 
     z = torch.linspace(0.0, 2.0, n, dtype=torch.float64)
-    cpo.update_lambdas(z)
+    cpo.update_lam(z)
 
     expected = torch.clamp(10.0 + 2.0 * z, 0.0, 12.0)
-    assert torch.allclose(cpo.lambdas, expected)
+    assert torch.allclose(cpo.lam, expected)
 
     print("  4. lambda update (Eq. 20)           : OK")
 
@@ -110,22 +110,22 @@ def test_smoke_training(steps: int = 60) -> None:
     cpo, sampler = agent.cpo, agent.sampler
 
     fixed = sampler.sample(128)
-    lam0 = cpo.lambdas.clone()
+    lam0 = cpo.lam.clone()
 
     before = cpo.evaluate_metrics(fixed)
     for _ in range(steps):
         cpo.train_step(sampler.sample(32))
 
     # Compare at the initial multipliers so only the policy changed.
-    cpo.lambdas = lam0
+    cpo.lam = lam0
     after = cpo.evaluate_metrics(fixed)
 
     assert after["loss"] < before["loss"], (before["loss"], after["loss"])
 
     print(f"  5. smoke run ({steps} steps)            : loss "
           f"{before['loss']:.3f} -> {after['loss']:.3f}, "
-          f"violation {before['violation']:.3f} -> {after['violation']:.3f}, "
-          f"cost {before['cost']:.0f} -> {after['cost']:.0f} $/h")
+          f"z_sum {before['z_sum']:.3f} -> {after['z_sum']:.3f}, "
+          f"f_sum {before['f_sum']:.0f} -> {after['f_sum']:.0f} $/h")
 
 
 def main() -> None:

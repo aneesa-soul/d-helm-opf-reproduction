@@ -1,18 +1,31 @@
-import numpy as np
-import pandapower.networks as pn
-import pandapower as pp
+"""
+IEEE 5-bus order-1 HELM test.
 
-from dhelm_opf.helm.problem import (
-    build_helm_problem_from_network,
-)
-from dhelm_opf.helm.embedding import (
-    HelmProblem,
-)
+Computes the first series term (n = 1) step by step with the paper's
+equations and checks it:
+
+    Eq. (11)  W_0 = 1 / V_0 = 1          (no-load germ V_0 = 1)
+    Eq. (12)  A x_1 = b_1
+    Eq. (13)  R_1, U_1
+
+Checks:
+    * slack:  V_{s,1} = v_s - 1
+    * PV:     Re(V_{i,1}) = U_{i,1} = (|v_i^sp|^2 - 1) / 2
+    * A x_1 = b_1 holds to round-off
+    * the step-by-step result equals solve_x_n() (used by the solver)
+"""
+
+import numpy as np
+import pandapower as pp
+import pandapower.networks as pn
+
+from dhelm_opf.helm.problem import build_helm_problem_from_network
 from dhelm_opf.helm.recursion import (
-    update_inverse_voltage_series,
-    build_coefficient_matrix,
-    build_RU_vectors,
-    solve_helm_coefficient,
+    build_A,
+    build_R_U,
+    compute_W,
+    init_V,
+    solve_x_n,
 )
 
 
@@ -20,205 +33,76 @@ print("=" * 70)
 print("D-HELM IEEE 5-BUS ORDER-1 TEST")
 print("=" * 70)
 
-
 # ============================================================
-# 1. Load IEEE 5-bus network
+# 1. Network and HELM problem
 # ============================================================
 
 net = pn.case5()
-
-print("\nRunning reference pandapower power flow...")
+net.ext_grid["vm_pu"] = 1.02            # non-trivial slack setpoint
 pp.runpp(net)
-
-print("Reference power flow converged:", net.converged)
-
-
-# ============================================================
-# 2. Construct HELM problem
-# ============================================================
 
 problem = build_helm_problem_from_network(net)
 
-print("\n" + "=" * 70)
-print("HELM PROBLEM")
-print("=" * 70)
-
-print("Ybus shape:", problem.ybus.shape)
-print("Slack bus :", problem.slack_bus)
-print("Slack V   :", problem.v_slack)
-print("PV buses  :", problem.pv_buses)
-print("PQ buses  :", problem.pq_buses)
-
-print("\nSpecified Sbus (per-unit):")
-
-for bus, value in enumerate(problem.s_spec):
-    print(
-        f"bus {bus}: "
-        f"P={value.real:.8f} pu, "
-        f"Q={value.imag:.8f} pu"
-    )
-
+print(f"B_s = {problem.B_s},  B_v = {problem.B_v},  B_q = {problem.B_q}")
+print("\nSpecified e_sp (p.u.):")
+for i, e_sp_i in enumerate(problem.e_sp):
+    print(f"  bus {i}: p = {e_sp_i.real:+.6f}, q = {e_sp_i.imag:+.6f}")
 
 # ============================================================
-# 3. Initial voltage series
+# 2. Germ and Eq. (11)
 # ============================================================
 
-order = 1
-n_bus = problem.ybus.shape[0]
+n = 1
+n_bus = problem.Y.shape[0]
 
-V = np.zeros(
-    (order + 1, n_bus),
-    dtype=np.complex128,
-)
+V = init_V(problem, n)                   # V[0] = 1
+Q = np.zeros((n + 1, n_bus))
+W = compute_W(V, n - 1)                  # W[0] = 1
 
-V[0, :] = 1.0 + 0.0j
-
-print("\nInitial V_0:")
-for bus, value in enumerate(V[0]):
-    print(
-        f"bus {bus}: "
-        f"{value.real:.8f} "
-        f"{value.imag:+.8f}j"
-    )
-
+assert np.allclose(V[0], 1.0) and np.allclose(W[0], 1.0)
 
 # ============================================================
-# 4. Eq. (11): inverse-voltage series
+# 3. Eqs. (12)-(13)
 # ============================================================
 
-W = update_inverse_voltage_series(
-    V,
-    order,
-)
+A, Y_tr, Y_sh = build_A(problem)
+P = np.real(problem.e_sp)
 
-print("\n" + "=" * 70)
-print("EQ. (11) — W COEFFICIENTS")
-print("=" * 70)
+R_1, U_1 = build_R_U(problem=problem, n=n, V=V, W=W, P=P, Q=Q, Y_sh=Y_sh)
+b_1 = np.concatenate([R_1.real, R_1.imag, U_1])
 
-print(W)
+x_1 = np.linalg.solve(A, b_1)
+V_1 = x_1[:n_bus] + 1j * x_1[n_bus:2 * n_bus]
+Q_1 = x_1[2 * n_bus:]
 
-
-# ============================================================
-# 5. Eq. (12): coefficient matrix
-# ============================================================
-
-A = build_coefficient_matrix(problem)
-
-print("\n" + "=" * 70)
-print("EQ. (12) — COEFFICIENT MATRIX")
-print("=" * 70)
-
-print("Shape :", A.shape)
-print("Rank  :", np.linalg.matrix_rank(A))
-print("Cond. :", np.linalg.cond(A))
-print("Det   :", np.linalg.det(A))
-
-
-# ============================================================
-# 6. Active-power specification
-#
-# IMPORTANT:
-# P is already in per-unit because build_sbus()
-# now converts MW -> pu.
-# ============================================================
-
-P = np.real(problem.s_spec)
-
-
-# ============================================================
-# 7. Reactive-power coefficient storage
-#
-# Q[k, bus] stores HELM reactive-power coefficients.
-# These are NOT copied from pandapower generator Q.
-# ============================================================
-
-Q = np.zeros(
-    (order + 1, n_bus),
-    dtype=float,
-)
-
-
-# ============================================================
-# 8. Eq. (13)
-# ============================================================
-
-R_1, U_1 = build_RU_vectors(
-    problem=problem,
-    voltage_coefficients=V,
-    inverse_voltage_coefficients=W,
-    order=order,
-    active_power=P,
-    reactive_power_coefficients=Q,
-)
-
-print("\n" + "=" * 70)
-print("EQ. (13)")
-print("=" * 70)
-
-print("\nR_1:")
-for bus, value in enumerate(R_1):
-    print(
-        f"bus {bus}: "
-        f"{value.real:.8f} "
-        f"{value.imag:+.8f}j"
-    )
-
-print("\nU_1:")
-for bus, value in enumerate(U_1):
-    print(
-        f"bus {bus}: "
-        f"{value.real:.8f} "
-        f"{value.imag:+.8f}j"
-    )
-
-
-# ============================================================
-# 9. Solve HELM order 1
-# ============================================================
-
-print("\n" + "=" * 70)
-print("SOLVING HELM ORDER 1")
-print("=" * 70)
-
-V_1, Q_1 = solve_helm_coefficient(
-    problem=problem,
-    coefficient_matrix=A,
-    voltage_coefficients=V,
-    inverse_voltage_coefficients=W,
-    order=order,
-    active_power=P,
-    reactive_power_coefficients=Q,
-)
-
-
-# ============================================================
-# 10. Results
-# ============================================================
-
-print("\n" + "=" * 70)
-print("HELM ORDER-1 RESULT")
-print("=" * 70)
+print(f"\nA: shape {A.shape}, rank {np.linalg.matrix_rank(A)}, "
+      f"cond {np.linalg.cond(A):.3e}")
 
 print("\nV_1:")
+for i, value in enumerate(V_1):
+    print(f"  bus {i}: {value.real:+.8f} {value.imag:+.8f}j")
 
-for bus, value in enumerate(V_1):
-    print(
-        f"bus {bus}: "
-        f"{value.real:.8f} "
-        f"{value.imag:+.8f}j "
-        f"|V|={abs(value):.8f} pu"
-    )
+print("\nQ_1 (PV buses):")
+for k, i in enumerate(problem.B_v):
+    print(f"  bus {i}: {Q_1[k]:+.8f}")
 
+# ============================================================
+# 4. Checks
+# ============================================================
 
-print("\nQ_1:")
+s = problem.B_s
+assert np.isclose(V_1[s], problem.v_s - 1.0), V_1[s]
 
-for position, bus in enumerate(problem.pv_buses):
-    print(
-        f"PV bus {bus}: "
-        f"Q_1={Q_1[position]:.8f} pu"
-    )
+for k, i in enumerate(problem.B_v):
+    assert np.isclose(V_1[i].real, U_1[k]), (i, V_1[i].real, U_1[k])
+    assert np.isclose(U_1[k], (problem.v_sp[i] ** 2 - 1.0) / 2.0)
 
+assert np.allclose(A @ x_1, b_1, atol=1e-12)
+
+V_1_solver, Q_1_solver = solve_x_n(problem, n, V, W, Q, A, Y_sh)
+assert np.allclose(V_1_solver, V_1)
+assert np.allclose(Q_1_solver[list(problem.B_v)], Q_1)
 
 print("\n" + "=" * 70)
-print("PASS: IEEE 5-bus order-1 HELM calculation completed.")
+print("PASS: IEEE 5-bus order-1 HELM calculation verified.")
 print("=" * 70)

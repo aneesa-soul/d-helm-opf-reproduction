@@ -5,27 +5,30 @@ Paper basis
 -----------
 Eq. (19), Lagrangian relaxation of (7):
 
-    min_{lambda >= 0} max_pi  E[ sum_t r_t  -  lambda^T sum_t z_t ]
+    min_{lam >= 0} max_pi  E[ sum_t r_t  -  lam^T sum_t z_t ]
 
 so the policy minimizes, per minibatch (Appendix A.1),
 
-    loss = - mean(r)  +  sum_n lambda_n * mean(z_n)
+    loss = - mean(r)  +  sum_n lam_n * mean(z_n)
 
 Eq. (20), multiplier update after each policy update:
 
-    lambda_n <- clip( lambda_n + eta_lambda * E[z_n],  0, lambda_max )
+    lam_n^(k+1) = Gamma_lam[ lam_n^(k) + eta_lam * E[z_n] ],
+    Gamma_lam projects onto [0, lam_max]
 
-Table 1: lambda^(0) = 10, Adam, lr 1e-3, minibatch 32 (5-bus).
+Table 1: lam^(0) = 10, Adam, lr 1e-3, minibatch 32 (5-bus).
 
 Because the critic is exact and differentiable, the policy gradient is
 obtained by back-propagating the loss through the critic (D-HELM) into
 the policy; there is no critic training step and no target network.
 
+Notation follows the paper (see NOTATION.md).
+
 Reproduction choices
 --------------------
-* eta_lambda = 1.0 and lambda_max = 1000 (not given in the paper).
-* As written, Eq. (20) never decreases lambda (z >= 0).  This is kept
-  as specified; lambda is logged so its growth can be monitored.
+* eta_lam = 1.0 and lam_max = 1000 (not given in the paper).
+* As written, Eq. (20) never decreases lam (z >= 0).  This is kept
+  as specified; lam is logged so its growth can be monitored.
 """
 
 from __future__ import annotations
@@ -44,9 +47,9 @@ class CPOConfig:
     lr: float = 1e-3
     batch_size: int = 32
     window: int = 1
-    lambda_init: float = 10.0
-    eta_lambda: float = 1.0
-    lambda_max: float = 1000.0
+    lam_0: float = 10.0
+    eta_lam: float = 1.0
+    lam_max: float = 1000.0
     grad_clip: float | None = None
 
 
@@ -54,12 +57,12 @@ class CPOConfig:
 class Evaluation:
     """Critic results for a batch of windows, flattened over time."""
 
-    actions: torch.Tensor     # (B, L, action_dim)
-    reward: torch.Tensor      # (B * L,)
-    cost: torch.Tensor        # (B * L,)
-    z: torch.Tensor           # (B * L, n_constraint)
-    converged: torch.Tensor   # (B * L,) bool
-    n_terms: int
+    a_hat: torch.Tensor       # (B, L, action_dim)  normalized actions
+    r: torch.Tensor           # (B * L,)  Eq. (5)
+    f_sum: torch.Tensor       # (B * L,)  sum_g f_g(p_g), $/h
+    z: torch.Tensor           # (B * L, n_constraint)  Eq. (6)
+    converged: torch.Tensor   # (B * L,) bool, D-HELM converged
+    N: int                    # D-HELM series terms used
 
 
 class DHelmCPO:
@@ -77,8 +80,8 @@ class DHelmCPO:
         self.config = config or CPOConfig()
 
         n_con = len(critic.constraint_names)
-        self.lambdas = torch.full(
-            (n_con,), self.config.lambda_init, dtype=torch.float64
+        self.lam = torch.full(
+            (n_con,), self.config.lam_0, dtype=torch.float64
         )
 
         self.optimizer = torch.optim.Adam(
@@ -87,89 +90,89 @@ class DHelmCPO:
 
     # ------------------------------------------------------------------
 
-    def evaluate(self, states: torch.Tensor) -> Evaluation:
+    def evaluate(self, s: torch.Tensor) -> Evaluation:
         """
-        Run the policy over (B, L, d) windows and evaluate every step
-        with the critic.  Gradients flow back into the policy.
+        Run the policy over (B, L, d) windows of states s and evaluate
+        every step with the critic.  Gradients flow back into the policy.
         """
 
-        if states.dim() == 2:
-            states = states.unsqueeze(1)
+        if s.dim() == 2:
+            s = s.unsqueeze(1)
 
-        actions = self.policy(states)                 # (B, L, a)
-        B, L, _ = actions.shape
+        a_hat = self.policy(s)                        # (B, L, a)
+        B, L, _ = a_hat.shape
 
         ccfg = self.critic.config
-        ramping = ccfg.ramp_up_mw is not None or ccfg.ramp_down_mw is not None
+        ramping = ccfg.R_u is not None or ccfg.R_d is not None
 
         if not ramping:
             # Steps are independent for the critic: evaluate in one batch.
             out = self.critic(
-                states.reshape(B * L, -1).to(torch.float64),
-                actions.reshape(B * L, -1).to(torch.float64),
+                s.reshape(B * L, -1).to(torch.float64),
+                a_hat.reshape(B * L, -1).to(torch.float64),
             )
             return Evaluation(
-                actions=actions,
-                reward=out.reward,
-                cost=out.cost,
+                a_hat=a_hat,
+                r=out.r,
+                f_sum=out.f_sum,
                 z=out.z,
                 converged=out.helm.converged,
-                n_terms=out.helm.n_terms,
+                N=out.helm.N,
             )
 
         # With ramping, (16b) at step t needs the slack output of t-1.
-        rewards, costs, zs, conv = [], [], [], []
-        prev_slack = None
-        n_terms = 0
+        r, f_sum, z, conv = [], [], [], []
+        p_g_s_prev = None
+        N = 0
 
         for t in range(L):
             out = self.critic(
-                states[:, t].to(torch.float64),
-                actions[:, t].to(torch.float64),
-                p_slack_prev_mw=prev_slack,
+                s[:, t].to(torch.float64),
+                a_hat[:, t].to(torch.float64),
+                p_g_s_prev=p_g_s_prev,
             )
-            rewards.append(out.reward)
-            costs.append(out.cost)
-            zs.append(out.z)
+            r.append(out.r)
+            f_sum.append(out.f_sum)
+            z.append(out.z)
             conv.append(out.helm.converged)
-            prev_slack = out.p_slack_mw
-            n_terms = max(n_terms, out.helm.n_terms)
+            p_g_s_prev = out.p_g_s
+            N = max(N, out.helm.N)
 
         # Order (b, t) to match the reshape used above.
         return Evaluation(
-            actions=actions,
-            reward=torch.stack(rewards, dim=1).reshape(-1),
-            cost=torch.stack(costs, dim=1).reshape(-1),
-            z=torch.stack(zs, dim=1).reshape(B * L, -1),
+            a_hat=a_hat,
+            r=torch.stack(r, dim=1).reshape(-1),
+            f_sum=torch.stack(f_sum, dim=1).reshape(-1),
+            z=torch.stack(z, dim=1).reshape(B * L, -1),
             converged=torch.stack(conv, dim=1).reshape(-1),
-            n_terms=n_terms,
+            N=N,
         )
 
     def loss(self, ev: Evaluation) -> torch.Tensor:
-        """Eq. (19): -mean(r) + sum_n lambda_n mean(z_n)."""
+        """Eq. (19): -mean(r) + sum_n lam_n mean(z_n)."""
 
-        return -ev.reward.mean() + (self.lambdas * ev.z.mean(dim=0)).sum()
+        return -ev.r.mean() + (self.lam * ev.z.mean(dim=0)).sum()
 
-    def update_lambdas(self, z_mean: torch.Tensor) -> None:
-        """Eq. (20)."""
+    def update_lam(self, z_mean: torch.Tensor) -> None:
+        """Eq. (20): lam <- Gamma_lam[lam + eta_lam E[z]]."""
 
         cfg = self.config
-        self.lambdas = torch.clamp(
-            self.lambdas + cfg.eta_lambda * z_mean.detach(),
+        self.lam = torch.clamp(
+            self.lam + cfg.eta_lam * z_mean.detach(),
             0.0,
-            cfg.lambda_max,
+            cfg.lam_max,
         )
 
-    def train_step(self, states: np.ndarray | torch.Tensor) -> dict:
+    def train_step(self, s: np.ndarray | torch.Tensor) -> dict:
         """
         One policy update on a minibatch of state windows, followed by
         the multiplier update.  Returns scalar metrics for logging.
         """
 
-        states = torch.as_tensor(states, dtype=torch.float32)
+        s = torch.as_tensor(s, dtype=torch.float32)
 
         self.policy.train()
-        ev = self.evaluate(states)
+        ev = self.evaluate(s)
         loss = self.loss(ev)
 
         self.optimizer.zero_grad()
@@ -183,38 +186,38 @@ class DHelmCPO:
         self.optimizer.step()
 
         z_mean = ev.z.mean(dim=0).detach()
-        self.update_lambdas(z_mean)
+        self.update_lam(z_mean)
 
-        return metrics(ev, loss=loss.item(), lambdas=self.lambdas,
+        return metrics(ev, loss=loss.item(), lam=self.lam,
                        names=self.critic.constraint_names)
 
     @torch.no_grad()
-    def evaluate_metrics(self, states) -> dict:
+    def evaluate_metrics(self, s) -> dict:
         """Metrics on a batch without updating anything."""
 
-        states = torch.as_tensor(states, dtype=torch.float32)
+        s = torch.as_tensor(s, dtype=torch.float32)
         self.policy.eval()
-        ev = self.evaluate(states)
-        return metrics(ev, loss=self.loss(ev).item(), lambdas=self.lambdas,
+        ev = self.evaluate(s)
+        return metrics(ev, loss=self.loss(ev).item(), lam=self.lam,
                        names=self.critic.constraint_names)
 
 
-def metrics(ev: Evaluation, loss: float, lambdas, names) -> dict:
-    """Scalar summary of an Evaluation."""
+def metrics(ev: Evaluation, loss: float, lam, names) -> dict:
+    """Scalar summary of an Evaluation (batch means)."""
 
     z = ev.z.detach()
-    total = z.sum(dim=1)
+    z_sum = z.sum(dim=1)
 
     m = {
         "loss": loss,
-        "reward": ev.reward.detach().mean().item(),
-        "cost": ev.cost.detach().mean().item(),
-        "violation": total.mean().item(),
-        "feasible": (total <= 1e-6).double().mean().item(),
+        "r": ev.r.detach().mean().item(),
+        "f_sum": ev.f_sum.detach().mean().item(),
+        "z_sum": z_sum.mean().item(),
+        "feasible": (z_sum <= 1e-6).double().mean().item(),
         "helm_converged": ev.converged.double().mean().item(),
-        "helm_terms": ev.n_terms,
+        "N": ev.N,
     }
     for k, name in enumerate(names):
         m[f"z/{name}"] = z[:, k].mean().item()
-        m[f"lambda/{name}"] = float(lambdas[k])
+        m[f"lam/{name}"] = float(lam[k])
     return m

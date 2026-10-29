@@ -43,7 +43,7 @@ from dhelm_opf.helm.solver import HelmSolverConfig, solve_helm
 N_SCENARIOS = 200
 SEED = 0
 
-TIGHT = HelmSolverConfig(max_order=60, tolerance=1e-10)
+TIGHT = HelmSolverConfig(n_max=60, epsilon=1e-10)
 PAPER = HelmSolverConfig()  # n_max = 30, tol = 1e-5
 
 
@@ -62,9 +62,9 @@ def build_random_network(rng, config):
     with contextlib.redirect_stdout(io.StringIO()):
         apply_wind_output(
             net=net,
-            wind_buses=config.wind_buses,
-            wind_scale=scenario.wind_scale,
-            wind_rated_mw=config.wind_rated_mw,
+            B_w=config.B_w,
+            p_w_scale=scenario.p_w_scale,
+            p_w_rated_mw=config.p_w_rated_mw,
         )
 
     pp.runpp(net)
@@ -92,11 +92,11 @@ def main() -> None:
         problem = build_helm_problem_from_network(net)
 
         tight = solve_helm(problem, TIGHT)
-        tight_errors.append(np.max(np.abs(tight.voltage - reference)))
+        tight_errors.append(np.max(np.abs(tight.v - reference)))
 
         paper = solve_helm(problem, PAPER)
-        paper_errors.append(np.max(np.abs(paper.voltage - reference)))
-        paper_orders.append(paper.order)
+        paper_errors.append(np.max(np.abs(paper.v - reference)))
+        paper_orders.append(paper.N)
 
         if not paper.converged:
             paper_failures += 1

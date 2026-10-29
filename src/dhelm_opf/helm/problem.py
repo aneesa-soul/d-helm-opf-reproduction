@@ -5,11 +5,12 @@ This module is the bridge between:
 
     pandapower network
             ↓
-        Ybus + Sbus
+        Y + e_sp
             ↓
         HelmProblem
 
 The conversion is deliberately kept separate from the HELM recursion.
+Notation follows the paper (see NOTATION.md).
 """
 
 from __future__ import annotations
@@ -20,9 +21,9 @@ import pandapower as pp
 from dhelm_opf.helm.embedding import HelmProblem
 
 
-def extract_ybus(net: pp.pandapowerNet) -> np.ndarray:
+def extract_Y(net: pp.pandapowerNet) -> np.ndarray:
     """
-    Extract the complex bus-admittance matrix from pandapower.
+    Extract the complex bus-admittance matrix Y from pandapower.
 
     A power flow must be executed before calling this function because
     pandapower constructs the internal PPC representation during the
@@ -32,21 +33,21 @@ def extract_ybus(net: pp.pandapowerNet) -> np.ndarray:
     if "_ppc" not in net:
         raise RuntimeError(
             "Pandapower internal data are unavailable. "
-            "Run pp.runpp(net) before extracting Ybus."
+            "Run pp.runpp(net) before extracting Y."
         )
 
-    ybus = net._ppc["internal"]["Ybus"]
+    Y = net._ppc["internal"]["Ybus"]
 
     # Pandapower may store Ybus as a sparse matrix.
-    if hasattr(ybus, "toarray"):
-        ybus = ybus.toarray()
+    if hasattr(Y, "toarray"):
+        Y = Y.toarray()
 
-    return np.asarray(ybus, dtype=np.complex128)
+    return np.asarray(Y, dtype=np.complex128)
 
 
-def get_slack_bus(net: pp.pandapowerNet) -> int:
+def get_B_s(net: pp.pandapowerNet) -> int:
     """
-    Return the pandapower bus index used as the external-grid bus.
+    Return the slack bus B_s (the external-grid bus).
 
     The IEEE 5-bus case has one external grid.
     """
@@ -60,14 +61,13 @@ def get_slack_bus(net: pp.pandapowerNet) -> int:
     return int(net.ext_grid.iloc[0]["bus"])
 
 
-def get_slack_voltage(net: pp.pandapowerNet) -> complex:
+def get_v_s(net: pp.pandapowerNet) -> complex:
     """
-    Return the specified complex voltage of the external-grid
-    slack bus.
+    Return the specified complex voltage of the slack bus.
 
     Pandapower stores the slack voltage as magnitude and angle:
 
-        V = vm_pu * exp(j * va_degree)
+        v_s = vm_pu * exp(j * va_degree)
 
     For the IEEE 5-bus case:
 
@@ -76,7 +76,7 @@ def get_slack_voltage(net: pp.pandapowerNet) -> complex:
 
     therefore:
 
-        V_slack = 1 + 0j
+        v_s = 1 + 0j
     """
 
     if len(net.ext_grid) != 1:
@@ -92,54 +92,56 @@ def get_slack_voltage(net: pp.pandapowerNet) -> complex:
 
     return vm * np.exp(1j * np.deg2rad(va_deg))
 
-def get_pv_buses(net: pp.pandapowerNet) -> tuple[int, ...]:
+
+def get_B_v(net: pp.pandapowerNet) -> tuple[int, ...]:
     """
-    Return buses containing in-service conventional generators.
+    Return the PV buses B_v: buses with in-service conventional
+    generators.
 
     In the pandapower IEEE 5-bus network, these correspond to
     PV-type buses because their active power and voltage magnitude
     are specified.
     """
 
-    pv_buses = []
+    B_v = []
 
     for _, row in net.gen.iterrows():
         if bool(row["in_service"]):
-            pv_buses.append(int(row["bus"]))
+            B_v.append(int(row["bus"]))
 
-    return tuple(sorted(set(pv_buses)))
+    return tuple(sorted(set(B_v)))
 
 
-def get_pq_buses(
+def get_B_q(
     net: pp.pandapowerNet,
-    slack_bus: int,
-    pv_buses: tuple[int, ...],
+    B_s: int,
+    B_v: tuple[int, ...],
 ) -> tuple[int, ...]:
     """
-    Identify buses that are neither slack nor PV buses.
+    Return the PQ buses B_q: buses that are neither slack nor PV.
     """
 
     excluded = {
-        slack_bus,
-        *pv_buses,
+        B_s,
+        *B_v,
     }
 
-    pq_buses = tuple(
+    B_q = tuple(
         bus
         for bus in range(len(net.bus))
         if bus not in excluded
     )
 
-    return pq_buses
+    return B_q
 
 
-def get_voltage_setpoints(
+def get_v_sp(
     net: pp.pandapowerNet,
-    slack_bus: int,
-    pv_buses: tuple[int, ...],
+    B_s: int,
+    B_v: tuple[int, ...],
 ) -> np.ndarray:
     """
-    Construct the specified voltage-magnitude vector.
+    Construct the specified voltage-magnitude vector |v_i|^sp.
 
     NaN indicates that no voltage magnitude is prescribed.
 
@@ -150,7 +152,7 @@ def get_voltage_setpoints(
 
     n_bus = len(net.bus)
 
-    setpoints = np.full(
+    v_sp = np.full(
         n_bus,
         np.nan,
         dtype=float,
@@ -158,7 +160,7 @@ def get_voltage_setpoints(
 
     # Slack voltage.
     ext_grid_row = net.ext_grid.iloc[0]
-    setpoints[slack_bus] = float(
+    v_sp[B_s] = float(
         ext_grid_row["vm_pu"]
     )
 
@@ -167,21 +169,26 @@ def get_voltage_setpoints(
         if bool(row["in_service"]):
             bus = int(row["bus"])
 
-            setpoints[bus] = float(
+            v_sp[bus] = float(
                 row["vm_pu"]
             )
 
-    return setpoints
+    return v_sp
 
-def build_sbus(net: pp.pandapowerNet) -> np.ndarray:
+
+def build_e_sp(net: pp.pandapowerNet) -> np.ndarray:
     """
-    Construct the specified complex bus-power vector for HELM.
+    Construct the specified complex injection e_i^sp = p_i + j q_i
+    (Eq. 8) for HELM:
+
+        p_i = sum_{g in G_i} p_g + p_i^w - p_i^d
+        q_i = (fixed sgen Q) - q_i^d
 
     All power quantities are converted from pandapower's MW/MVAr
     representation into per-unit using the network base power.
 
-    Positive values represent net active-power injection.
-    Negative values represent net active-power demand.
+    Positive values represent net injection.
+    Negative values represent net demand.
 
     For HELM:
         - PQ-bus P and Q are specified.
@@ -203,7 +210,7 @@ def build_sbus(net: pp.pandapowerNet) -> np.ndarray:
     q = np.zeros(n_bus, dtype=float)
 
     # ------------------------------------------------------------
-    # Generator active power
+    # Generator active power p_g
     # ------------------------------------------------------------
     if len(net.gen) > 0:
         for _, row in net.gen.iterrows():
@@ -211,7 +218,7 @@ def build_sbus(net: pp.pandapowerNet) -> np.ndarray:
                 bus = int(row["bus"])
                 p[bus] += float(row["p_mw"]) / base_mva
 
-
+    # Static generators (conventional sgens and wind p^w)
     if len(net.sgen) > 0:
         for _, row in net.sgen.iterrows():
             if bool(row["in_service"]):
@@ -228,7 +235,7 @@ def build_sbus(net: pp.pandapowerNet) -> np.ndarray:
                 )
 
     # ------------------------------------------------------------
-    # Loads
+    # Loads p^d, q^d
     # ------------------------------------------------------------
     if len(net.load) > 0:
         for _, row in net.load.iterrows():
@@ -244,10 +251,10 @@ def build_sbus(net: pp.pandapowerNet) -> np.ndarray:
     # Do NOT add generator Q here.
     #
     # For PV buses, reactive power is an unknown HELM coefficient
-    # and is solved through Eq. (12)-(13) of the paper.
+    # Q_{i,n} and is solved through Eqs. (12)-(13) of the paper.
     #
-    # Therefore q currently represents the specified PQ-bus
-    # reactive injection only.
+    # Therefore q represents the specified PQ-bus reactive
+    # injection only.
     # ------------------------------------------------------------
 
     return p + 1j * q
@@ -270,34 +277,34 @@ def build_helm_problem_from_network(
         Mathematical representation required by the HELM solver.
     """
 
-    ybus = extract_ybus(net)
-    sbus = build_sbus(net)
+    Y = extract_Y(net)
+    e_sp = build_e_sp(net)
 
-    slack_bus = get_slack_bus(net)
-    slack_voltage = get_slack_voltage(net)
+    B_s = get_B_s(net)
+    v_s = get_v_s(net)
 
-    pv_buses = get_pv_buses(net)
+    B_v = get_B_v(net)
 
-    pq_buses = get_pq_buses(
+    B_q = get_B_q(
         net,
-        slack_bus,
-        pv_buses,
+        B_s,
+        B_v,
     )
 
-    voltage_setpoints = get_voltage_setpoints(
+    v_sp = get_v_sp(
         net,
-        slack_bus,
-        pv_buses,
+        B_s,
+        B_v,
     )
 
     return HelmProblem(
-        ybus=ybus,
-        s_spec=sbus,
-        v_slack=slack_voltage,
-        slack_bus=slack_bus,
-        pv_buses=pv_buses,
-        pq_buses=pq_buses,
-        voltage_setpoints=voltage_setpoints,
+        Y=Y,
+        e_sp=e_sp,
+        v_s=v_s,
+        B_s=B_s,
+        B_v=B_v,
+        B_q=B_q,
+        v_sp=v_sp,
     )
 
 
@@ -310,18 +317,18 @@ def inspect_helm_problem(problem: HelmProblem) -> None:
     print("HELM problem")
     print("=" * 70)
 
-    print(f"Number of buses : {problem.ybus.shape[0]}")
-    print(f"Slack bus       : {problem.slack_bus}")
-    print(f"Slack voltage   : {problem.v_slack}")
-    print(f"Ybus shape      : {problem.ybus.shape}")
-    print(f"Sbus shape      : {problem.s_spec.shape}")
+    print(f"Number of buses : {problem.Y.shape[0]}")
+    print(f"Slack bus B_s   : {problem.B_s}")
+    print(f"Slack voltage   : {problem.v_s}")
+    print(f"Y shape         : {problem.Y.shape}")
+    print(f"e_sp shape      : {problem.e_sp.shape}")
 
-    print("\nSpecified complex bus injections:")
-    for bus, value in enumerate(problem.s_spec):
+    print("\nSpecified complex bus injections e_sp:")
+    for bus, value in enumerate(problem.e_sp):
         print(
             f"  bus {bus}: "
-            f"P={value.real:.6f} p.u., "
-            f"Q={value.imag:.6f} p.u."
+            f"p={value.real:.6f} p.u., "
+            f"q={value.imag:.6f} p.u."
         )
 
 

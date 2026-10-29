@@ -63,8 +63,8 @@ def solved_net(state, action, config):
     scenario = OperatingScenario(state[0:3], state[3:6], state[6:8])
     apply_demand_uncertainty(net, scenario)
     with contextlib.redirect_stdout(io.StringIO()):
-        apply_wind_output(net, UNC.wind_buses, scenario.wind_scale,
-                          UNC.wind_rated_mw)
+        apply_wind_output(net, UNC.B_w, scenario.p_w_scale,
+                          UNC.p_w_rated_mw)
     apply_action_to_network(net, config, ActionDecoder(config).decode(action))
     pp.runpp(net, tolerance_mva=1e-10)
     return net
@@ -79,19 +79,19 @@ def eq6(x, lo, hi):
     return (np.maximum(0, x - hi) + np.maximum(0, lo - x)) / (hi - lo)
 
 
-def reference(net, voltage_buses):
-    """Quantities, z and reward computed from pandapower and net tables."""
+def reference(net, B_vs):
+    """Quantities, z and r computed from pandapower and net tables."""
 
     res = net.res_bus
     eg = net.ext_grid.iloc[0]
-    slack_bus = int(eg["bus"])
+    B_s = int(eg["bus"])
 
-    pq = [b for b in net.bus.index
-          if b not in voltage_buses]
+    B_q = [b for b in net.bus.index
+          if b not in B_vs]
 
     # unit Q per voltage bus (controllable units only, as in Eq. 16c)
-    q_bus, q_lo, q_hi = [], [], []
-    for b in voltage_buses:
+    q_g, q_g_min, q_g_max = [], [], []
+    for b in B_vs:
         q = lo = hi = 0.0
         for i, row in net.gen.iterrows():
             if row["bus"] == b:
@@ -103,50 +103,50 @@ def reference(net, voltage_buses):
                 q += net.res_sgen.at[i, "q_mvar"]
                 lo += row["min_q_mvar"]
                 hi += row["max_q_mvar"]
-        if b == slack_bus:
+        if b == B_s:
             q += net.res_ext_grid.at[0, "q_mvar"]
             lo += eg["min_q_mvar"]
             hi += eg["max_q_mvar"]
-        q_bus.append(q)
-        q_lo.append(lo)
-        q_hi.append(hi)
-    q_bus, q_lo, q_hi = map(np.array, (q_bus, q_lo, q_hi))
+        q_g.append(q)
+        q_g_min.append(lo)
+        q_g_max.append(hi)
+    q_g, q_g_min, q_g_max = map(np.array, (q_g, q_g_min, q_g_max))
 
-    p_slack = net.res_ext_grid.at[0, "p_mw"]
-    v_pq = res.loc[pq, "vm_pu"].to_numpy()
+    p_g_s = net.res_ext_grid.at[0, "p_mw"]
+    v_q = res.loc[B_q, "vm_pu"].to_numpy()
 
     i_max = net.line["max_i_ka"].to_numpy()
     limited = i_max < 1e4
-    i_from = net.res_line["i_from_ka"].to_numpy()
-    i_to = net.res_line["i_to_ka"].to_numpy()
+    i_f = net.res_line["i_from_ka"].to_numpy()
+    i_t = net.res_line["i_to_ka"].to_numpy()
 
-    # cost from poly_cost and pandapower's dispatch
-    cost = 0.0
-    cost_max = 0.0
+    # f_sum from poly_cost and pandapower's dispatch
+    f_sum = 0.0
+    f_max = 0.0
     for _, c in net.poly_cost.iterrows():
         table, idx = c["et"], int(c["element"])
         p = net[f"res_{table}"].at[idx, "p_mw"]
         pmax = net[table].at[idx, "max_p_mw"]
         coef = (c["cp0_eur"], c["cp1_eur_per_mw"], c["cp2_eur_per_mw2"])
-        cost += coef[0] + coef[1] * p + coef[2] * p ** 2
-        cost_max += coef[0] + coef[1] * pmax + coef[2] * pmax ** 2
+        f_sum += coef[0] + coef[1] * p + coef[2] * p ** 2
+        f_max += coef[0] + coef[1] * pmax + coef[2] * pmax ** 2
 
     z = np.concatenate(
         [
-            eq6(v_pq, net.bus.loc[pq, "min_vm_pu"].to_numpy(),
-                net.bus.loc[pq, "max_vm_pu"].to_numpy()),
-            [eq6(p_slack, eg["min_p_mw"], eg["max_p_mw"])],
-            eq6(q_bus, q_lo, q_hi),
-            eq6(i_from[limited], -i_max[limited], i_max[limited]),
-            eq6(i_to[limited], -i_max[limited], i_max[limited]),
+            eq6(v_q, net.bus.loc[B_q, "min_vm_pu"].to_numpy(),
+                net.bus.loc[B_q, "max_vm_pu"].to_numpy()),
+            [eq6(p_g_s, eg["min_p_mw"], eg["max_p_mw"])],
+            eq6(q_g, q_g_min, q_g_max),
+            eq6(i_f[limited], -i_max[limited], i_max[limited]),
+            eq6(i_t[limited], -i_max[limited], i_max[limited]),
         ]
     )
 
     return dict(
-        p_slack=p_slack, q_bus=q_bus, v_pq=v_pq,
-        i_from=i_from, i_to=i_to,
-        cost=cost, cost_max=cost_max,
-        reward=2.0 - cost / cost_max, z=z,
+        p_g_s=p_g_s, q_g=q_g, v_q=v_q,
+        i_f=i_f, i_t=i_t,
+        f_sum=f_sum, f_max=f_max,
+        r=2.0 - f_sum / f_max, z=z,
     )
 
 
@@ -160,24 +160,24 @@ def test_vs_reference(critic, config, rng, batch=100):
     assert bool(out.helm.converged.all())
 
     err = {k: 0.0 for k in
-           ("p_slack", "q_bus", "v_pq", "i_from", "i_to", "cost",
-            "reward", "z")}
+           ("p_g_s", "q_g", "v_q", "i_f", "i_t", "f_sum",
+            "r", "z")}
     violated = np.zeros(len(critic.constraint_names), dtype=int)
-    cost_max = None
+    f_max = None
 
     for k in range(batch):
         ref = reference(solved_net(state[k], action[k], config),
-                        list(config.voltage_buses))
-        cost_max = ref["cost_max"]
+                        list(config.B_vs))
+        f_max = ref["f_max"]
 
         mine = dict(
-            p_slack=out.p_slack_mw[k].item(),
-            q_bus=out.q_bus_mvar[k].detach().numpy(),
-            v_pq=out.v_pq[k].detach().numpy(),
-            i_from=out.i_from_ka[k].detach().numpy(),
-            i_to=out.i_to_ka[k].detach().numpy(),
-            cost=out.cost[k].item(),
-            reward=out.reward[k].item(),
+            p_g_s=out.p_g_s[k].item(),
+            q_g=out.q_g[k].detach().numpy(),
+            v_q=out.v_q[k].detach().numpy(),
+            i_f=out.i_f[k].detach().numpy(),
+            i_t=out.i_t[k].detach().numpy(),
+            f_sum=out.f_sum[k].item(),
+            r=out.r[k].item(),
             z=out.z[k].detach().numpy(),
         )
         for key in err:
@@ -186,10 +186,10 @@ def test_vs_reference(critic, config, rng, batch=100):
                                                - np.asarray(ref[key])))))
         violated += ref["z"] > 0
 
-    assert abs(cost_max - critic.cost_max) < 1e-9, cost_max
+    assert abs(f_max - critic.f_max) < 1e-9, f_max
 
-    tol = dict(p_slack=1e-5, q_bus=1e-5, v_pq=1e-8, i_from=1e-8,
-               i_to=1e-8, cost=1e-3, reward=1e-8, z=1e-7)
+    tol = dict(p_g_s=1e-5, q_g=1e-5, v_q=1e-8, i_f=1e-8,
+               i_t=1e-8, f_sum=1e-3, r=1e-8, z=1e-7)
 
     print(f"  1-2. critic vs pandapower + NumPy ({batch} random samples)")
     for key, value in err.items():
@@ -204,25 +204,25 @@ def test_vs_reference(critic, config, rng, batch=100):
 def test_ramping(dhelm, net, rng):
 
     critic = DHELMCritic(
-        dhelm, net, CriticConfig(ramp_up_mw=10.0, ramp_down_mw=10.0)
+        dhelm, net, CriticConfig(R_u=10.0, R_d=10.0)
     )
 
     # Find a sample whose slack output is well inside [0, 200] MW.
     for _ in range(200):
         state, action = random_batch(rng, 1, action_range=0.6)
         out = critic(as_t(state), as_t(action))
-        p = out.p_slack_mw.item()
+        p = out.p_g_s.item()
         if 30.0 < p < 170.0:
             break
     else:
         raise RuntimeError("No interior slack sample found.")
 
-    k = critic.constraint_names.index("p_slack")
+    k = critic.constraint_names.index("p_g[slack]")
     eta = 1.0 / 200.0
 
-    up = critic(as_t(state), as_t(action), p_slack_prev_mw=as_t([p - 25.0]))
-    down = critic(as_t(state), as_t(action), p_slack_prev_mw=as_t([p + 25.0]))
-    inside = critic(as_t(state), as_t(action), p_slack_prev_mw=as_t([p - 5.0]))
+    up = critic(as_t(state), as_t(action), p_g_s_prev=as_t([p - 25.0]))
+    down = critic(as_t(state), as_t(action), p_g_s_prev=as_t([p + 25.0]))
+    inside = critic(as_t(state), as_t(action), p_g_s_prev=as_t([p - 5.0]))
     no_prev = critic(as_t(state), as_t(action))
 
     assert np.isclose(up.z[0, k].item(), 15.0 * eta)
@@ -242,12 +242,12 @@ def test_gradcheck(critic, rng):
     a = as_t(action).requires_grad_(True)
 
     def f(s_, a_):
-        out = critic(s_, a_, n_terms=8)
-        return out.reward, out.z
+        out = critic(s_, a_, N=8)
+        return out.r, out.z
 
     assert torch.autograd.gradcheck(f, (s, a), eps=1e-6, atol=1e-6)
 
-    out = critic(as_t(state), as_t(action), n_terms=8)
+    out = critic(as_t(state), as_t(action), N=8)
     n_active = int((out.z > 0).sum())
     print(f"  4. gradcheck (reward, z)         : passed "
           f"({n_active} active violations in the batch)")
@@ -262,7 +262,7 @@ def main() -> None:
     config = action_config_from_network(net)
 
     dhelm = DHelmNetwork(net, config, UNC,
-                         HelmSolverConfig(max_order=60, tolerance=1e-10))
+                         HelmSolverConfig(n_max=60, epsilon=1e-10))
     critic = DHELMCritic(dhelm, net)
 
     print(critic.describe())

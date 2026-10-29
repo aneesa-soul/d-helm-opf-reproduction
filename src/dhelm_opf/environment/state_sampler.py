@@ -33,29 +33,29 @@ class StateSampler:
 
     State layout (matches scenario_to_state and DHelmNetwork):
 
-        [p_d scale (n_load), q_d scale (n_load), wind scale (n_wind)]
+        [p_d scale (n_d), q_d scale (n_d), p_w scale (n_w)]
     """
 
     def __init__(
         self,
-        n_load: int,
-        n_wind: int,
+        n_d: int,
+        n_w: int,
         config: UncertaintyConfig | None = None,
         seed: int | None = None,
     ) -> None:
 
         self.config = config or UncertaintyConfig()
-        self.n_load = n_load
-        self.n_wind = n_wind
-        self.state_dim = 2 * n_load + n_wind
+        self.n_d = n_d
+        self.n_w = n_w
+        self.state_dim = 2 * n_d + n_w
         self.rng = np.random.default_rng(seed)
 
         c = self.config
         self.low = np.array(
-            [c.demand_min] * (2 * n_load) + [c.wind_min] * n_wind
+            [c.demand_min] * (2 * n_d) + [c.wind_min] * n_w
         )
         self.high = np.array(
-            [c.demand_max] * (2 * n_load) + [c.wind_max] * n_wind
+            [c.demand_max] * (2 * n_d) + [c.wind_max] * n_w
         )
 
     def sample(self, n: int) -> np.ndarray:

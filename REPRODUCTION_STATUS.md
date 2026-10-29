@@ -19,6 +19,10 @@ This distinction is maintained so that assumptions are not presented as exact au
 
 ---
 
+## Notation
+
+Variable names in the code follow the paper's equation symbols. `NOTATION.md` lists every paper symbol with its Python spelling (for example α → `alpha`, λ → `lam`, \|v_i\|^sp → `v_sp`, Y^sh → `Y_sh`).
+
 ## Current Progress
 
 ### 1. Repository and project structure
@@ -162,8 +166,8 @@ Reproduction choices and interpretations:
 
 * **Q limits are per bus (Eq. 16c literally).** A bus limit is the sum of the limits of the controllable units on it. Bus 0 (gen0 ±30 and sgen0 ±127.5) therefore has ±157.5 MVAr. This also matches how pandapower's OPF treats a controllable sgen.
 * **η_n = 1 / (x̄_n − x̲_n)** is our reading of Table 1's "η = (Z_max − Z_min)⁻¹". For line currents the bounds of Eqs. (16d)–(16e) are −i … i, so η = 1 / (2 i_max).
-* **w_r = 1 / cost_max** is our reading of Table 1's "w_r = cost1max". Here cost_max = Σ f_g(P̄_g) over all units, slack included, which is 32,710 $/h. With w₀ = 2 the reward lies roughly in [1, 2].
-* **Ramping (16b) is implemented but off by default.** The case data has no ramp rates, and the paper's states are sampled independently, with no time series. `CriticConfig.ramp_up_mw` / `ramp_down_mw` and the critic input `p_slack_prev_mw` enable it.
+* **w_r = 1 / f_max** is our reading of Table 1's "w_r = cost1max". Here f_max = Σ f_g(P̄_g) over all units, slack included, which is 32,710 $/h. With w₀ = 2 the reward lies roughly in [1, 2].
+* **Ramping (16b) is implemented but off by default.** The case data has no ramp rates, and the paper's states are sampled independently, with no time series. `CriticConfig.R_u` / `R_d` and the critic input `p_g_s_prev` enable it.
 * **Lines with no rating have no current constraint.** In case5, lines 1–4 have pandapower's placeholder max_i_ka = 99,999 kA, which comes from MATPOWER rateA = 0.
 
 Validation (`scripts/test_dhelm_critic.py`), on 100 random samples over the full action range:
@@ -237,7 +241,7 @@ Components:
 * **Best checkpoint** (`scripts/train_dhelm_case5.py`). Among the validation evaluations (256 states, seed 10000 + seed, never trained on), it is the one with the lowest validation cost that has ≥ 99% feasible states. If none qualifies, the lowest validation loss is used instead. The output files are `policy_best.pt` and `summary.json`.
 * **Optional cosine learning-rate decay** (`--lr-schedule cosine`, decaying to 10% of the initial rate). The default is constant, as in the paper.
 * **Cached OPF reference** (`utils/opf_reference.py`). The matched OPF (unrated lines unconstrained, slack voltage free; see Section 8) is solved once for the 100 test states (seed 20000) and stored in `results/opf_reference/`. It is reused only if the states match exactly.
-* **Shared evaluation** (`utils/evaluation.py`). This is used by `scripts/evaluate_vs_opf.py` (`--checkpoint best|last`, `--refine none|r1|r2`, `--refine-steps K`) and by `scripts/run_seeds.py`, so both report identical numbers.
+* **Shared evaluation** (`utils/evaluation.py`). This is used by `scripts/evaluate_vs_opf.py` (`--checkpoint best|last`, `--refine none|r1|r2`, `--refine-K K`) and by `scripts/run_seeds.py`, so both report identical numbers.
 * **Refinement** (`algorithms/refine.py`). Gradient steps on each state's action through the critic, on J = −r + Σ λₙ zₙ with the trained λ. The policy weights are untouched. The variable is the pre-tanh action, so actions stay in bounds. Each state keeps its best iterate: feasible beats infeasible, then lower cost, then lower violation. The starting action counts as a candidate, and iterates where D-HELM did not converge are rejected, so refinement never makes a state worse. Defaults: Adam, lr 0.03.
   * **R1, paper-faithful (Remark 5).** Only states that fail the feasibility test are refined, and each stops as soon as it is feasible. Feasible states are returned unchanged.
   * **R2, our extension.** Every state is refined for K steps, which lowers the cost as well. The policy becomes a warm start for a first-order OPF solve through the critic.

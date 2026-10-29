@@ -15,18 +15,18 @@ def main() -> None:
     print()
 
     # Dimensions (paper, Table 1)
-    assert config.n_voltage == 4
-    assert config.n_generator == 4
+    assert config.n_v == 4
+    assert config.n_g == 4
     assert config.action_dim == 8
 
     # Voltage-controlled buses: PV {0, 2, 4} + slack {3}
-    assert config.voltage_buses == (0, 2, 3, 4)
-    assert config.slack.bus == 3
-    assert config.voltage_min == (0.9, 0.9, 0.9, 0.9)
-    assert config.voltage_max == (1.1, 1.1, 1.1, 1.1)
+    assert config.B_vs == (0, 2, 3, 4)
+    assert config.G_s.bus == 3
+    assert config.v_min == (0.9, 0.9, 0.9, 0.9)
+    assert config.v_max == (1.1, 1.1, 1.1, 1.1)
 
     # Non-slack generators, ordered by bus (gen before sgen)
-    labels = [unit.label for unit in config.generators]
+    labels = [unit.label for unit in config.G_ns]
     assert labels == [
         "gen0@bus0",
         "sgen0@bus0",
@@ -35,9 +35,9 @@ def main() -> None:
     ], labels
 
     # Limits and costs come from the case data
-    assert [u.p_max_mw for u in config.generators] == [40, 170, 520, 600]
-    assert [u.cp1 for u in config.generators] == [14, 15, 30, 10]
-    assert (config.slack.p_max_mw, config.slack.cp1) == (200, 40)
+    assert [u.P_max for u in config.G_ns] == [40, 170, 520, 600]
+    assert [u.cp1 for u in config.G_ns] == [14, 15, 30, 10]
+    assert (config.G_s.P_max, config.G_s.cp1) == (200, 40)
 
     print("All action-config tests passed.")
 

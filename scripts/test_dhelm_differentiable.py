@@ -68,15 +68,15 @@ def pandapower_net(state, action, config, run=True, **runpp_kwargs):
     net = build_case5()
 
     scenario = OperatingScenario(
-        demand_p_scale=state[0:3],
-        demand_q_scale=state[3:6],
-        wind_scale=state[6:8],
+        p_d_scale=state[0:3],
+        q_d_scale=state[3:6],
+        p_w_scale=state[6:8],
     )
     apply_demand_uncertainty(net, scenario)
 
     with contextlib.redirect_stdout(io.StringIO()):
         apply_wind_output(
-            net, UNC.wind_buses, scenario.wind_scale, UNC.wind_rated_mw
+            net, UNC.B_w, scenario.p_w_scale, UNC.p_w_rated_mw
         )
 
     apply_action_to_network(net, config, ActionDecoder(config).decode(action))
@@ -100,19 +100,19 @@ def test_vs_numpy(dhelm, config, rng, batch=32):
     state, action = random_batch(rng, batch)
     worst = 0.0
 
-    for n_terms in (1, 2, 4, 8):
+    for N in (1, 2, 4, 8):
 
-        out = dhelm(as_t(state), as_t(action), n_terms=n_terms)
+        out = dhelm(as_t(state), as_t(action), N=N)
         v_t = out.v_re.detach().numpy() + 1j * out.v_im.detach().numpy()
 
         for k in range(batch):
             net = pandapower_net(state[k], action[k], config)
             ref = solve_helm_series(
                 build_helm_problem_from_network(net),
-                max_order=n_terms,
-                tol=0.0,              # never stop early: exactly n_terms
+                n_max=N,
+                epsilon=0.0,              # never stop early: exactly N
             )
-            worst = max(worst, np.max(np.abs(v_t[k] - ref["voltage"])))
+            worst = max(worst, np.max(np.abs(v_t[k] - ref["v"])))
 
     assert worst < 1e-12, worst
     print(f"  1. torch vs NumPy (same N)       : max error {worst:.1e}")
@@ -140,13 +140,13 @@ def test_vs_pandapower(dhelm, config, rng, batch=64):
         worst = max(worst, np.max(np.abs(v_t[k] - ref)))
 
     q_gap = torch.max(
-        torch.abs(out.q_pv - out.e_im[:, dhelm.pv_idx])
+        torch.abs(out.q_v - out.e_im[:, dhelm.B_v_idx])
     ).item()
 
     assert worst < 1e-4, worst
     assert q_gap < 1e-4, q_gap
 
-    print(f"  2. adaptive stop vs pandapower   : N = {out.n_terms}, "
+    print(f"  2. adaptive stop vs pandapower   : N = {out.N}, "
           f"max error {worst:.1e} (tol 1e-5)")
     print(f"     sum Q_n vs Im(e) at PV buses  : max gap {q_gap:.1e}")
 
@@ -162,8 +162,8 @@ def test_full_range(dhelm, rng, batch=500):
 
     n_conv = int(out.converged.sum())
     print(f"  3. full action range [-1, 1]     : {n_conv}/{batch} "
-          f"converged, N = {out.n_terms} "
-          f"(n_max = {dhelm.solver_config.max_order}, informational)")
+          f"converged, N = {out.N} "
+          f"(n_max = {dhelm.solver_config.n_max}, informational)")
 
 
 # ----------------------------------------------------------------------
@@ -178,8 +178,8 @@ def test_gradcheck(dhelm, rng):
     a = as_t(action).requires_grad_(True)
 
     def f(s_, a_):
-        out = dhelm(s_, a_, n_terms=6)   # fixed N: constant control flow
-        return out.v_re, out.v_im, out.q_pv, out.e_re
+        out = dhelm(s_, a_, N=6)   # fixed N: constant control flow
+        return out.v_re, out.v_im, out.q_v, out.e_re
 
     ok = torch.autograd.gradcheck(f, (s, a), eps=1e-6, atol=1e-6)
     assert ok
@@ -202,21 +202,21 @@ def test_physics_jacobian(config, rng, h=1e-4):
         build_case5(),
         config,
         UNC,
-        HelmSolverConfig(max_order=60, tolerance=1e-12),
+        HelmSolverConfig(n_max=60, epsilon=1e-12),
     )
 
     state, action = random_batch(rng, 1)
     state, action = state[0], action[0]
 
-    slack = tight.slack
-    q_buses = sorted(tight.pv + [slack])
+    B_s = tight.B_s
+    q_buses = sorted(tight.B_v + [B_s])
 
     def torch_outputs(a_):
         out = tight(as_t(state), a_)
         return torch.cat(
             [
-                out.v_mag[0],
-                out.e_re[0, [slack]],
+                out.v_abs[0],
+                out.e_re[0, [B_s]],
                 out.e_im[0, q_buses],
             ]
         )
@@ -234,7 +234,7 @@ def test_physics_jacobian(config, rng, h=1e-4):
         return np.concatenate(
             [
                 res["vm_pu"].to_numpy(),
-                [-res["p_mw"].to_numpy()[slack] / base],
+                [-res["p_mw"].to_numpy()[B_s] / base],
                 -res["q_mvar"].to_numpy()[q_buses] / base,
             ]
         )
@@ -264,17 +264,17 @@ def test_timing(dhelm, rng, batch=32, repeats=20):
     a = as_t(action).requires_grad_(True)
 
     # warm-up
-    dhelm(s, a).v_mag.sum().backward()
+    dhelm(s, a).v_abs.sum().backward()
 
     start = time.perf_counter()
     for _ in range(repeats):
         a.grad = None
         out = dhelm(s, a)
-        out.v_mag.sum().backward()
+        out.v_abs.sum().backward()
     elapsed = (time.perf_counter() - start) / repeats
 
     print(f"  6. forward + backward, batch {batch} : "
-          f"{1e3 * elapsed:.1f} ms (N = {out.n_terms})")
+          f"{1e3 * elapsed:.1f} ms (N = {out.N})")
 
 
 def main() -> None:

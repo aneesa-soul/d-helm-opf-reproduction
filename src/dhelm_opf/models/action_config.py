@@ -17,16 +17,16 @@ The mapping is DERIVED from the paper's Table 1 definition and the case
 data; it is not a free assumption.  `action_config_from_network()`
 reads it from the pandapower network:
 
-    voltage buses : buses of in-service `gen` units  ∪  ext_grid bus
-    generators    : in-service `gen` units and controllable, non-wind
-                    `sgen` units (the slack unit is excluded)
+    B_vs = B_v ∪ B_s : buses of in-service `gen` units  ∪  ext_grid bus
+    G_ns = G / G_s   : in-service `gen` units and controllable, non-wind
+                       `sgen` units (the slack unit G_s is excluded)
     limits        : bus min/max_vm_pu, unit min/max_p_mw, min/max_q_mvar
     costs         : net.poly_cost
 
 For the IEEE 5-bus case this gives 4 + 4 = 8, matching Table 1:
 
-    voltage buses : (0, 2, 3, 4)            PV {0, 2, 4} + slack {3}
-    generators    : gen0@0, sgen0@0, gen1@2, gen2@4
+    B_vs : (0, 2, 3, 4)            B_v = {0, 2, 4},  B_s = {3}
+    G_ns : gen0@0, sgen0@0, gen1@2, gen2@4
 
 Wind units are tagged with sgen.type == WIND_SGEN_TYPE (see
 environment/uncertainty.py) and are never treated as controllable
@@ -49,19 +49,22 @@ class GeneratorUnit:
     """
     One controllable generating unit, identified by its pandapower table.
 
-    Power limits are in MW / MVAr.  Cost follows pandapower's poly_cost:
+    P_min, P_max : active-power limits  (P̲_g, P̄_g), MW
+    q_min, q_max : reactive limits      (q̲_g, q̄_g), MVAr
 
-        cost = cp0 + cp1 * p_mw + cp2 * p_mw**2
+    Cost f_g(p_g) (Eq. 5) follows pandapower's poly_cost:
+
+        f_g = cp0 + cp1 * p_g + cp2 * p_g**2
     """
 
     table: str          # "gen", "sgen" or "ext_grid"
     index: int          # row index in that table
     bus: int
 
-    p_min_mw: float
-    p_max_mw: float
-    q_min_mvar: float
-    q_max_mvar: float
+    P_min: float
+    P_max: float
+    q_min: float
+    q_max: float
 
     cp0: float
     cp1: float
@@ -79,35 +82,35 @@ class ActionConfig:
 
     Action layout
     -------------
-    action[0 : n_v]          voltage setpoints of `voltage_buses`
-    action[n_v : n_v + n_g]  active-power setpoints of `generators`
+    a[0 : n_v]          |v_i|, i in B_vs = B_v ∪ B_s   (bounds v_min, v_max)
+    a[n_v : n_v + n_g]  p_g,   g in G_ns = G / G_s     (bounds P_min, P_max)
 
-    The slack unit is not an action; its P and Q are outputs of the
-    critic (paper Eqs. 15-16).  Its limits and cost are kept here
-    because the critic needs them.
+    The slack unit G_s is not an action; its p_g and q_g are outputs
+    of the critic (paper Eqs. 15-16).  Its limits and cost are kept
+    here because the critic needs them.
     """
 
-    voltage_buses: Tuple[int, ...]
-    voltage_min: Tuple[float, ...]
-    voltage_max: Tuple[float, ...]
+    B_vs: Tuple[int, ...]
+    v_min: Tuple[float, ...]
+    v_max: Tuple[float, ...]
 
-    generators: Tuple[GeneratorUnit, ...]
-    slack: GeneratorUnit
+    G_ns: Tuple[GeneratorUnit, ...]
+    G_s: GeneratorUnit
 
     base_mva: float
 
     def __post_init__(self) -> None:
 
-        n_v = len(self.voltage_buses)
+        n_v = len(self.B_vs)
 
-        if not (n_v == len(self.voltage_min) == len(self.voltage_max)):
+        if not (n_v == len(self.v_min) == len(self.v_max)):
             raise ValueError(
-                "voltage_buses, voltage_min and voltage_max must "
+                "B_vs, v_min and v_max must "
                 "have equal length."
             )
 
         for bus, vmin, vmax in zip(
-            self.voltage_buses, self.voltage_min, self.voltage_max
+            self.B_vs, self.v_min, self.v_max
         ):
             if vmin >= vmax:
                 raise ValueError(
@@ -115,13 +118,13 @@ class ActionConfig:
                     f"[{vmin}, {vmax}]."
                 )
 
-        for unit in (*self.generators, self.slack):
-            if unit.p_min_mw > unit.p_max_mw:
+        for unit in (*self.G_ns, self.G_s):
+            if unit.P_min > unit.P_max:
                 raise ValueError(f"Pmin > Pmax for {unit.label}.")
-            if unit.q_min_mvar > unit.q_max_mvar:
+            if unit.q_min > unit.q_max:
                 raise ValueError(f"Qmin > Qmax for {unit.label}.")
 
-        if self.slack.bus not in self.voltage_buses:
+        if self.G_s.bus not in self.B_vs:
             raise ValueError(
                 "The slack bus must be a voltage-controlled bus."
             )
@@ -134,37 +137,39 @@ class ActionConfig:
     # ------------------------------------------------------------------
 
     @property
-    def n_voltage(self) -> int:
-        return len(self.voltage_buses)
+    def n_v(self) -> int:
+        return len(self.B_vs)
 
     @property
-    def n_generator(self) -> int:
-        return len(self.generators)
+    def n_g(self) -> int:
+        return len(self.G_ns)
 
     @property
     def action_dim(self) -> int:
         """|B_v ∪ B_s| + |G / G_s| (paper, Table 1)."""
-        return self.n_voltage + self.n_generator
+        return self.n_v + self.n_g
 
     @property
     def voltage_action_indices(self) -> Tuple[int, ...]:
-        return tuple(range(self.n_voltage))
+        return tuple(range(self.n_v))
 
     @property
     def generator_action_indices(self) -> Tuple[int, ...]:
-        return tuple(range(self.n_voltage, self.action_dim))
+        return tuple(range(self.n_v, self.action_dim))
 
     # ------------------------------------------------------------------
     # Bound vectors (convenient for the decoder / critic)
     # ------------------------------------------------------------------
 
     @property
-    def generator_p_min_mw(self) -> np.ndarray:
-        return np.array([u.p_min_mw for u in self.generators])
+    def P_min(self) -> np.ndarray:
+        """P̲_g of the non-slack units G_ns (MW)."""
+        return np.array([u.P_min for u in self.G_ns])
 
     @property
-    def generator_p_max_mw(self) -> np.ndarray:
-        return np.array([u.p_max_mw for u in self.generators])
+    def P_max(self) -> np.ndarray:
+        """P̄_g of the non-slack units G_ns (MW)."""
+        return np.array([u.P_max for u in self.G_ns])
 
     def describe(self) -> str:
         """Human-readable description of the action layout."""
@@ -172,16 +177,16 @@ class ActionConfig:
         lines = [
             "D-HELM OPF action configuration (derived from network)",
             "",
-            f"Action dimension : {self.n_voltage} voltage "
-            f"+ {self.n_generator} generator P = {self.action_dim}",
+            f"Action dimension : {self.n_v} voltage "
+            f"+ {self.n_g} generator P = {self.action_dim}",
             "",
             "Voltage setpoints:",
         ]
 
         for k, (bus, vmin, vmax) in enumerate(
-            zip(self.voltage_buses, self.voltage_min, self.voltage_max)
+            zip(self.B_vs, self.v_min, self.v_max)
         ):
-            kind = "slack" if bus == self.slack.bus else "PV"
+            kind = "slack" if bus == self.G_s.bus else "PV"
             lines.append(
                 f"  a[{k}]  bus {bus} ({kind:5s})  "
                 f"[{vmin:.2f}, {vmax:.2f}] p.u."
@@ -190,18 +195,18 @@ class ActionConfig:
         lines.append("")
         lines.append("Generator active-power setpoints:")
 
-        for k, unit in zip(self.generator_action_indices, self.generators):
+        for k, unit in zip(self.generator_action_indices, self.G_ns):
             lines.append(
                 f"  a[{k}]  {unit.label:15s}  "
-                f"[{unit.p_min_mw:.1f}, {unit.p_max_mw:.1f}] MW  "
+                f"[{unit.P_min:.1f}, {unit.P_max:.1f}] MW  "
                 f"cost {unit.cp1:.1f} $/MWh"
             )
 
         lines.append("")
         lines.append(
-            f"Slack (critic output, not an action): {self.slack.label}  "
-            f"[{self.slack.p_min_mw:.1f}, {self.slack.p_max_mw:.1f}] MW  "
-            f"cost {self.slack.cp1:.1f} $/MWh"
+            f"Slack (critic output, not an action): {self.G_s.label}  "
+            f"[{self.G_s.P_min:.1f}, {self.G_s.P_max:.1f}] MW  "
+            f"cost {self.G_s.cp1:.1f} $/MWh"
         )
 
         return "\n".join(lines)
@@ -257,10 +262,10 @@ def _make_unit(net, table: str, index: int) -> GeneratorUnit:
         table=table,
         index=int(index),
         bus=int(row["bus"]),
-        p_min_mw=_required(row, "min_p_mw", label),
-        p_max_mw=_required(row, "max_p_mw", label),
-        q_min_mvar=_required(row, "min_q_mvar", label),
-        q_max_mvar=_required(row, "max_q_mvar", label),
+        P_min=_required(row, "min_p_mw", label),
+        P_max=_required(row, "max_p_mw", label),
+        q_min=_required(row, "min_q_mvar", label),
+        q_max=_required(row, "max_q_mvar", label),
         cp0=cp0,
         cp1=cp1,
         cp2=cp2,
@@ -316,7 +321,7 @@ def action_config_from_network(net: pp.pandapowerNet) -> ActionConfig:
     # Only `gen` units regulate voltage in pandapower; an sgen is a
     # PQ injection, so it does not add a voltage-controlled bus.
     # ------------------------------------------------------------
-    voltage_buses = sorted(
+    B_vs = sorted(
         {
             int(row["bus"])
             for _, row in net.gen.iterrows()
@@ -325,20 +330,20 @@ def action_config_from_network(net: pp.pandapowerNet) -> ActionConfig:
         | {slack.bus}
     )
 
-    voltage_min = tuple(
+    v_min = tuple(
         _required(net.bus.loc[bus], "min_vm_pu", f"bus{bus}")
-        for bus in voltage_buses
+        for bus in B_vs
     )
-    voltage_max = tuple(
+    v_max = tuple(
         _required(net.bus.loc[bus], "max_vm_pu", f"bus{bus}")
-        for bus in voltage_buses
+        for bus in B_vs
     )
 
     return ActionConfig(
-        voltage_buses=tuple(voltage_buses),
-        voltage_min=voltage_min,
-        voltage_max=voltage_max,
-        generators=tuple(units),
-        slack=slack,
+        B_vs=tuple(B_vs),
+        v_min=v_min,
+        v_max=v_max,
+        G_ns=tuple(units),
+        G_s=slack,
         base_mva=float(net.sn_mva),
     )

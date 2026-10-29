@@ -9,16 +9,16 @@ from dhelm_opf.environment.uncertainty import (
 )
 
 from dhelm_opf.helm.problem import (
-    build_sbus,
+    build_e_sp,
     build_helm_problem_from_network,
 )
-from dhelm_opf.helm.problem import build_sbus
+from dhelm_opf.helm.problem import build_e_sp
 from dhelm_opf.helm.solver import solve_helm
 
 
 CONFIG = UncertaintyConfig(
-    wind_buses=(1, 4),
-    wind_rated_mw=(100.0, 100.0),
+    B_w=(1, 4),
+    p_w_rated_mw=(100.0, 100.0),
 )
 
 
@@ -26,19 +26,19 @@ def run_case(wind_level: float):
     net = build_case5()
 
     scenario = OperatingScenario(
-        demand_p_scale=np.ones(3),
-        demand_q_scale=np.ones(3),
-        wind_scale=np.array([wind_level, wind_level]),
+        p_d_scale=np.ones(3),
+        q_d_scale=np.ones(3),
+        p_w_scale=np.array([wind_level, wind_level]),
     )
 
     apply_wind_output(
         net=net,
-        wind_buses=CONFIG.wind_buses,
-        wind_scale=scenario.wind_scale,
-        wind_rated_mw=CONFIG.wind_rated_mw,
+        B_w=CONFIG.B_w,
+        p_w_scale=scenario.p_w_scale,
+        p_w_rated_mw=CONFIG.p_w_rated_mw,
     )
 
-    sbus = build_sbus(net)
+    sbus = build_e_sp(net)
 
     # Rebuild pandapower's internal power-flow/Ybus representation
     # after changing the network generation.
@@ -72,7 +72,7 @@ if __name__ == "__main__":
             )
 
         print("\nHELM voltage magnitudes:")
-        print(solution.voltage_magnitude)
+        print(solution.v_abs)
 
         print("\nHELM voltage angles:")
-        print(solution.voltage_angle)
+        print(solution.theta)

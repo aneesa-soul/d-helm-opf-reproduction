@@ -29,8 +29,8 @@ with the multipliers lambda learned during training.
 
 Implementation
 --------------
-* The optimization variable is the pre-tanh action u, a = tanh(u), so
-  actions can never leave their bounds (as in Eq. 18).
+* The optimization variable is the pre-tanh action `logit`,
+  a_hat = tanh(logit), so actions can never leave their bounds (Eq. 18).
 * All states are refined in one batch.  The loss is the SUM of J over
   the active states and Adam is element-wise, so each state's update is
   exactly what it would be if it were refined alone.
@@ -56,21 +56,21 @@ DTYPE = torch.float64
 @dataclass(frozen=True)
 class RefineConfig:
     mode: str = "r1"            # "r1" (paper) or "r2" (extension)
-    steps: int = 20             # gradient-step budget K
+    K: int = 20                 # gradient-step budget
     lr: float = 0.05            # Adam step size in pre-tanh space
     feasible_tol: float = 1e-6  # feasibility test: sum(z) <= tol
 
     def __post_init__(self):
         if self.mode not in ("r1", "r2"):
             raise ValueError("mode must be 'r1' or 'r2'.")
-        if self.steps < 0:
-            raise ValueError("steps must be >= 0.")
+        if self.K < 0:
+            raise ValueError("K must be >= 0.")
 
 
 @dataclass
 class RefineResult:
-    actions: torch.Tensor       # (S, a) refined normalized actions
-    cost: torch.Tensor          # (S,)
+    a_hat: torch.Tensor         # (S, a) refined normalized actions
+    f_sum: torch.Tensor         # (S,)  sum_g f_g(p_g), $/h
     z: torch.Tensor             # (S, n_constraint)
     feasible: torch.Tensor      # (S,) bool
     refined: torch.Tensor       # (S,) bool, state was optimized at all
@@ -80,15 +80,15 @@ class RefineResult:
 
 def refine_actions(
     critic: DHELMCritic,
-    lambdas: torch.Tensor,
-    states: torch.Tensor,
-    actions: torch.Tensor,
+    lam: torch.Tensor,
+    s: torch.Tensor,
+    a_hat: torch.Tensor,
     config: RefineConfig,
 ) -> RefineResult:
-    """Refine (S, a) actions for (S, d) states.  See module docstring."""
+    """Refine (S, a) actions a_hat for (S, d) states s.  See module docstring."""
 
     ccfg = critic.config
-    if ccfg.ramp_up_mw is not None or ccfg.ramp_down_mw is not None:
+    if ccfg.R_u is not None or ccfg.R_d is not None:
         raise NotImplementedError(
             "Refinement with ramping needs the previous step's slack "
             "output; not implemented."
@@ -96,16 +96,16 @@ def refine_actions(
 
     start = time.perf_counter()
 
-    states = torch.as_tensor(states, dtype=DTYPE)
-    a0 = torch.as_tensor(actions, dtype=DTYPE).detach()
-    lam = torch.as_tensor(lambdas, dtype=DTYPE)
+    s = torch.as_tensor(s, dtype=DTYPE)
+    a0 = torch.as_tensor(a_hat, dtype=DTYPE).detach()
+    lam = torch.as_tensor(lam, dtype=DTYPE)
     tol = config.feasible_tol
 
     eps = 1e-9
-    u = torch.atanh(a0.clamp(-1 + eps, 1 - eps)).clone().requires_grad_(True)
-    opt = torch.optim.Adam([u], lr=config.lr)
+    logit = torch.atanh(a0.clamp(-1 + eps, 1 - eps)).clone().requires_grad_(True)
+    opt = torch.optim.Adam([logit], lr=config.lr)
 
-    S = states.shape[0]
+    S = s.shape[0]
 
     best_a = a0.clone()
     best_cost = torch.full((S,), float("inf"), dtype=DTYPE)
@@ -116,13 +116,13 @@ def refine_actions(
     refined = torch.zeros(S, dtype=torch.bool)
     steps_taken = torch.zeros(S, dtype=torch.long)
 
-    for k in range(config.steps + 1):
+    for k in range(config.K + 1):
 
-        a = torch.tanh(u)
-        out = critic(states, a)
+        a_k = torch.tanh(logit)
+        out = critic(s, a_k)
 
         with torch.no_grad():
-            cost = out.cost.detach()
+            cost = out.f_sum.detach()
             viol = out.z.detach().sum(dim=1)
             feas = viol <= tol
             valid = out.helm.converged
@@ -135,7 +135,7 @@ def refine_actions(
             )
             # At k = 0 the candidate is the ORIGINAL action, not
             # tanh(atanh(a0)), so untouched states return a0 exactly.
-            cand = a0 if k == 0 else a.detach()
+            cand = a0 if k == 0 else a_k.detach()
             best_a[better] = cand[better]
             best_cost[better] = cost[better]
             best_viol[better] = viol[better]
@@ -148,30 +148,30 @@ def refine_actions(
                 # R1: a state stops as soon as it is feasible.
                 active = active & ~(feas & valid)
 
-        if k == config.steps or not bool(active.any()):
+        if k == config.K or not bool(active.any()):
             break
 
-        J = -out.reward + (lam * out.z).sum(dim=1)
+        J = -out.r + (lam * out.z).sum(dim=1)
         loss = (J * active.to(DTYPE)).sum()
 
         opt.zero_grad()
         loss.backward()
 
-        frozen = u.detach().clone()
+        frozen = logit.detach().clone()
         opt.step()
         with torch.no_grad():
-            u[~active] = frozen[~active]      # Adam momentum must not move them
+            logit[~active] = frozen[~active]  # Adam momentum must not move them
 
         steps_taken += active.long()
 
     with torch.no_grad():
-        final = critic(states, best_a)
+        final = critic(s, best_a)
 
     viol = final.z.sum(dim=1)
 
     return RefineResult(
-        actions=best_a,
-        cost=final.cost.detach(),
+        a_hat=best_a,
+        f_sum=final.f_sum.detach(),
         z=final.z.detach(),
         feasible=viol <= tol,
         refined=refined,

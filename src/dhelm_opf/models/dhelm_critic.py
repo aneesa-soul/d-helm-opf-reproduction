@@ -6,26 +6,28 @@ Paper basis
 Sec. 3.2.2, Eq. (17) steps 4-6.  Given the batched D-HELM solution
 (voltages v and injections e) the critic computes
 
-    (15)   slack active power      p_g = Re(e_s) + p_d,s - p_w,s
-    (16a)  PQ-bus voltage limits   v_min <= |v_i| <= v_max,  i in PQ
+    (15)   slack active power      p_g = Re(e_i) - p_i^w + p_i^d,  i in B_s
+    (16a)  PQ-bus voltage limits   v_min <= |v_i| <= v_max,        i in B_q
     (16b)  slack P limits          max{P_min, p*_g - R_d} <= p_g
-                                       <= min{P_max, p*_g + R_u}
-    (16c)  generator Q limits      q_min <= q_g = Im(e_i) + q_d,i <= q_max,
-                                   i in slack ∪ PV
-    (16d)  sending-end current     |i_f| = |Y_f v| I_base <= i_max
-    (16e)  receiving-end current   |i_t| = |Y_t v| I_base <= i_max
-    (6)    violations              z_n = eta_n (max{0, x - x_max}
-                                               + max{0, x_min - x})
-    (5)    reward                  r = w0 - w_r * sum_g f_g(p_g)
+                                       <= min{P_max, R_u + p*_g}
+    (16c)  unit Q limits           q_g_min <= q_g = Im(e_i) + q_i^d <= q_g_max,
+                                   i in B_s ∪ B_v
+    (16d)  sending-end current     -i_max <= i_f = Y_f v I_base <= i_max
+    (16e)  receiving-end current   -i_max <= i_t = Y_t v I_base <= i_max
+    (6)    violations              z_n = eta_n (max{0, x_n - x_max}
+                                                + max{0, x_min - x_n})
+    (5)    reward                  r = w_0 - w_r * sum_g f_g(p_g)
 
 Everything is a torch operation on the D-HELM output, so r and z are
-differentiable with respect to the (normalized) action and the state.
+differentiable with respect to a_hat and s.
 
 Voltages at PV and slack buses are actions bounded by the tanh scaling
 (Eq. 18) and are therefore not constraints here, as in the paper.
 
 The Lagrangian combination of r and z (Eqs. 19-20) belongs to the
 training algorithm, not to the critic.
+
+Notation follows the paper (see NOTATION.md).
 
 Reproduction choices (see REPRODUCTION_STATUS.md)
 -------------------------------------------------
@@ -36,10 +38,10 @@ Reproduction choices (see REPRODUCTION_STATUS.md)
 * eta_n = 1 / (x_max - x_min), our reading of Table 1's
   "eta = (Z_max - Z_min)^-1".  For line currents the bounds of
   (16d)-(16e) are -i_max .. i_max, so eta = 1 / (2 i_max).
-* w_r = 1 / cost_max, our reading of Table 1's "w_r = cost1max", with
-  cost_max = sum over all units (slack included) of f_g(P_max).
-* Ramping (16b) is supported but off by default: the case data has no
-  ramp rates and the paper's states are sampled independently.
+* w_r = 1 / f_max, our reading of Table 1's "w_r = cost1max", with
+  f_max = sum over all units (slack included) of f_g(P_max).
+* Ramping (16b) is supported for the slack unit (R_u, R_d in MW per
+  step, off when None).
 * Lines whose max_i_ka is pandapower's "unlimited" placeholder
   (MATPOWER rateA = 0 -> 99999 kA) carry no current constraint.
 """
@@ -60,13 +62,13 @@ from dhelm_opf.helm.differentiable import DTYPE, DHelmNetwork, DHelmOutput
 class CriticConfig:
     """Critic settings that are not part of the network data."""
 
-    # Eq. (5), Table 1: w0 = 2.
-    w0: float = 2.0
+    # Eq. (5), Table 1: w_0 = 2.
+    w_0: float = 2.0
 
-    # Eq. (16b) ramp limits of the slack unit in MW per step.
+    # Eq. (16b) ramp limits R_u, R_d of the slack unit, MW per step.
     # None = no ramp constraint (only P_min / P_max).
-    ramp_up_mw: float | None = None
-    ramp_down_mw: float | None = None
+    R_u: float | None = None
+    R_d: float | None = None
 
     # max_i_ka at or above this value is treated as "no limit".
     unlimited_current_ka: float = 1e4
@@ -77,31 +79,31 @@ class CriticOutput:
     """
     Physical quantities, constraint violations and reward for a batch.
 
-    Units: voltages p.u., power MW / MVAr, currents kA, cost $/h.
+    Units: |v| p.u., power MW / MVAr, currents kA, cost $/h.
     """
 
     helm: DHelmOutput
 
-    p_gen_mw: torch.Tensor        # (B, n_gen)   non-slack units (actions)
-    p_slack_mw: torch.Tensor      # (B,)         Eq. (15)
-    q_bus_mvar: torch.Tensor      # (B, n_vbus)  Eq. (16c), voltage buses
-    v_pq: torch.Tensor            # (B, n_pq)    Eq. (16a)
-    i_from_ka: torch.Tensor       # (B, n_line)  Eq. (16d), all lines
-    i_to_ka: torch.Tensor         # (B, n_line)  Eq. (16e), all lines
+    p_g: torch.Tensor          # (B, n_g)      p_g of G_ns (actions), MW
+    p_g_s: torch.Tensor        # (B,)          slack p_g, Eq. (15), MW
+    q_g: torch.Tensor          # (B, |B_vs|)   unit Q per bus, Eq. (16c), MVAr
+    v_q: torch.Tensor          # (B, |B_q|)    |v_i|, i in B_q, Eq. (16a)
+    i_f: torch.Tensor          # (B, n_line)   |i_f|, Eq. (16d), kA
+    i_t: torch.Tensor          # (B, n_line)   |i_t|, Eq. (16e), kA
 
-    cost: torch.Tensor            # (B,)  sum_g f_g(p_g), $/h
-    reward: torch.Tensor          # (B,)  Eq. (5)
-    z: torch.Tensor               # (B, n_constraint)  Eq. (6)
+    f_sum: torch.Tensor        # (B,)  sum_g f_g(p_g), $/h
+    r: torch.Tensor            # (B,)  Eq. (5)
+    z: torch.Tensor            # (B, n_constraint)  Eq. (6)
 
     @property
-    def total_violation(self) -> torch.Tensor:
+    def z_sum(self) -> torch.Tensor:
         return self.z.sum(dim=1)
 
 
-def violation(x, lower, upper, eta):
-    """Eq. (6): eta * (max{0, x - upper} + max{0, lower - x})."""
+def violation(x, x_min, x_max, eta):
+    """Eq. (6): eta * (max{0, x - x_max} + max{0, x_min - x})."""
 
-    return eta * (torch.relu(x - upper) + torch.relu(lower - x))
+    return eta * (torch.relu(x - x_max) + torch.relu(x_min - x))
 
 
 class DHELMCritic(torch.nn.Module):
@@ -133,7 +135,7 @@ class DHELMCritic(torch.nn.Module):
 
         acfg = dhelm.action_config
         base = dhelm.base_mva
-        device = dhelm.LU.device
+        device = dhelm.A_LU.device
 
         def t(x):
             return torch.tensor(np.array(x, dtype=float), dtype=DTYPE,
@@ -143,47 +145,47 @@ class DHELMCritic(torch.nn.Module):
         pp.runpp(net)
 
         # ------------------------------------------------------------
-        # (16a) PQ-bus voltage limits
+        # (16a) PQ-bus voltage limits v_min, v_max
         # ------------------------------------------------------------
-        pq = dhelm.pq
-        v_lo = net.bus.loc[pq, "min_vm_pu"].to_numpy(dtype=float)
-        v_hi = net.bus.loc[pq, "max_vm_pu"].to_numpy(dtype=float)
+        B_q = dhelm.B_q
+        v_min = net.bus.loc[B_q, "min_vm_pu"].to_numpy(dtype=float)
+        v_max = net.bus.loc[B_q, "max_vm_pu"].to_numpy(dtype=float)
 
-        self.register_buffer("v_lo", t(v_lo))
-        self.register_buffer("v_hi", t(v_hi))
+        self.register_buffer("v_min", t(v_min))
+        self.register_buffer("v_max", t(v_max))
 
         # ------------------------------------------------------------
         # (16b) slack P limits
         # ------------------------------------------------------------
-        slack = acfg.slack
-        self.p_slack_min = slack.p_min_mw
-        self.p_slack_max = slack.p_max_mw
+        G_s = acfg.G_s
+        self.P_min_s = G_s.P_min
+        self.P_max_s = G_s.P_max
 
         # ------------------------------------------------------------
         # (16c) Q limits per voltage bus = sum of unit limits on it
         # ------------------------------------------------------------
-        vbus = list(acfg.voltage_buses)
-        q_lo = np.zeros(len(vbus))
-        q_hi = np.zeros(len(vbus))
+        B_vs = list(acfg.B_vs)
+        q_g_min = np.zeros(len(B_vs))
+        q_g_max = np.zeros(len(B_vs))
 
-        for unit in (*acfg.generators, slack):
-            k = vbus.index(unit.bus) if unit.bus in vbus else None
+        for unit in (*acfg.G_ns, G_s):
+            k = B_vs.index(unit.bus) if unit.bus in B_vs else None
             if k is not None:
-                q_lo[k] += unit.q_min_mvar
-                q_hi[k] += unit.q_max_mvar
+                q_g_min[k] += unit.q_min
+                q_g_max[k] += unit.q_max
 
-        self.register_buffer("q_lo", t(q_lo))
-        self.register_buffer("q_hi", t(q_hi))
+        self.register_buffer("q_g_min", t(q_g_min))
+        self.register_buffer("q_g_max", t(q_g_max))
         self.register_buffer(
-            "vbus_idx",
-            torch.as_tensor(vbus, dtype=torch.long, device=device),
+            "B_vs_idx",
+            torch.as_tensor(B_vs, dtype=torch.long, device=device),
         )
 
-        # The Q setpoint of controllable sgens is part of q_spec in the
-        # D-HELM, but here it belongs to the unit's free Q (per-bus
-        # aggregation), so it is added back.
+        # The Q setpoint of controllable sgens is part of q (Eq. 8) in
+        # the D-HELM, but here it belongs to the unit's free q_g
+        # (per-bus aggregation), so it is added back.
         q_ctrl = np.zeros(dhelm.n_bus)
-        for unit in acfg.generators:
+        for unit in acfg.G_ns:
             if unit.table == "sgen":
                 row = net.sgen.loc[unit.index]
                 q_ctrl[unit.bus] += float(row["q_mvar"]) * float(row["scaling"]) / base
@@ -197,23 +199,23 @@ class DHELMCritic(torch.nn.Module):
             raise ValueError(
                 "Only networks whose branches are all lines (in net.line "
                 "order) are supported so far; transformers need their "
-                "own Yf/Yt rows and base current."
+                "own Y_f/Y_t rows and base current."
             )
 
         ppc = net._ppc["internal"]
-        Yf = ppc["Yf"].toarray()
-        Yt = ppc["Yt"].toarray()
+        Y_f = ppc["Yf"].toarray()
+        Y_t = ppc["Yt"].toarray()
 
-        self.register_buffer("Yf_g", t(np.real(Yf)))
-        self.register_buffer("Yf_b", t(np.imag(Yf)))
-        self.register_buffer("Yt_g", t(np.real(Yt)))
-        self.register_buffer("Yt_b", t(np.imag(Yt)))
+        self.register_buffer("Y_f_re", t(np.real(Y_f)))
+        self.register_buffer("Y_f_im", t(np.imag(Y_f)))
+        self.register_buffer("Y_t_re", t(np.real(Y_t)))
+        self.register_buffer("Y_t_im", t(np.imag(Y_t)))
 
         vn_from = net.bus.loc[net.line["from_bus"], "vn_kv"].to_numpy(dtype=float)
         vn_to = net.bus.loc[net.line["to_bus"], "vn_kv"].to_numpy(dtype=float)
 
-        self.register_buffer("ibase_from", t(base / (np.sqrt(3) * vn_from)))
-        self.register_buffer("ibase_to", t(base / (np.sqrt(3) * vn_to)))
+        self.register_buffer("I_base_f", t(base / (np.sqrt(3) * vn_from)))
+        self.register_buffer("I_base_t", t(base / (np.sqrt(3) * vn_to)))
 
         i_max = (
             net.line["max_i_ka"] * net.line["df"] * net.line["parallel"]
@@ -228,137 +230,137 @@ class DHELMCritic(torch.nn.Module):
         self.register_buffer("i_max", t(i_max[limited]))
 
         # ------------------------------------------------------------
-        # (5) costs: generators in ActionConfig order, then slack
+        # (5) costs f_g: units G_ns in ActionConfig order, then G_s
         # ------------------------------------------------------------
-        units = list(acfg.generators)
+        units = list(acfg.G_ns)
         self.register_buffer("cp0", t([u.cp0 for u in units]))
         self.register_buffer("cp1", t([u.cp1 for u in units]))
         self.register_buffer("cp2", t([u.cp2 for u in units]))
-        self.slack_cost = (slack.cp0, slack.cp1, slack.cp2)
+        self.cp_s = (G_s.cp0, G_s.cp1, G_s.cp2)
 
-        def f(c, p):
-            return c[0] + c[1] * p + c[2] * p ** 2
+        def f_g(c, p_g):
+            return c[0] + c[1] * p_g + c[2] * p_g ** 2
 
-        cost_max = sum(
-            f((u.cp0, u.cp1, u.cp2), u.p_max_mw) for u in (*units, slack)
+        f_max = sum(
+            f_g((u.cp0, u.cp1, u.cp2), u.P_max) for u in (*units, G_s)
         )
-        self.cost_max = float(cost_max)
-        self.w_r = 1.0 / self.cost_max
+        self.f_max = float(f_max)
+        self.w_r = 1.0 / self.f_max
 
         # ------------------------------------------------------------
         # Constraint names, in the order of z
         # ------------------------------------------------------------
         self.constraint_names = (
-            [f"v[bus{b}]" for b in pq]
-            + ["p_slack"]
-            + [f"q[bus{b}]" for b in vbus]
-            + [f"i_from[line{k}]" for k in limited]
-            + [f"i_to[line{k}]" for k in limited]
+            [f"v[bus{b}]" for b in B_q]
+            + ["p_g[slack]"]
+            + [f"q_g[bus{b}]" for b in B_vs]
+            + [f"i_f[line{k}]" for k in limited]
+            + [f"i_t[line{k}]" for k in limited]
         )
 
     # ------------------------------------------------------------------
 
     def _line_currents(self, v_re, v_im):
-        """|Y_f v| and |Y_t v| in kA for all lines."""
+        """|Y_f v| I_base and |Y_t v| I_base in kA for all lines."""
 
-        def mag(G, B, ibase):
-            i_re = v_re @ G.T - v_im @ B.T
-            i_im = v_im @ G.T + v_re @ B.T
-            return torch.sqrt(i_re ** 2 + i_im ** 2) * ibase
+        def mag(Y_br_re, Y_br_im, I_base):
+            i_re = v_re @ Y_br_re.T - v_im @ Y_br_im.T
+            i_im = v_im @ Y_br_re.T + v_re @ Y_br_im.T
+            return torch.sqrt(i_re ** 2 + i_im ** 2) * I_base
 
         return (
-            mag(self.Yf_g, self.Yf_b, self.ibase_from),
-            mag(self.Yt_g, self.Yt_b, self.ibase_to),
+            mag(self.Y_f_re, self.Y_f_im, self.I_base_f),
+            mag(self.Y_t_re, self.Y_t_im, self.I_base_t),
         )
 
     def forward(
         self,
-        state: torch.Tensor,
-        action: torch.Tensor,
-        p_slack_prev_mw: torch.Tensor | None = None,
-        n_terms: int | None = None,
+        s: torch.Tensor,
+        a_hat: torch.Tensor,
+        p_g_s_prev: torch.Tensor | None = None,
+        N: int | None = None,
     ) -> CriticOutput:
         """
         Evaluate the critic.
 
-        p_slack_prev_mw:
-            (B,) slack output of the previous step, p*_g in (16b).
+        p_g_s_prev:
+            (B,) slack output of the previous step, p*_g in (16b), MW.
             Only used when ramp limits are configured.
-        n_terms:
+        N:
             Passed to the D-HELM (fixed number of terms; for tests).
         """
 
         cfg = self.config
         base = self.dhelm.base_mva
-        s = self.dhelm.slack
+        B_s = self.dhelm.B_s
 
-        out = self.dhelm(state, action, n_terms=n_terms)
+        out = self.dhelm(s, a_hat, N=N)
         specs = out.specs
 
-        # ---- (15) slack P: injection minus everything else on the bus
-        p_slack = base * (out.e_re[:, s] - specs.p_spec[:, s])
+        # ---- (15) slack p_g: injection minus everything else on the bus
+        p_g_s = base * (out.e_re[:, B_s] - specs.p[:, B_s])
 
-        # ---- (16c) unit Q per voltage bus
-        vb = self.vbus_idx
-        q_bus = base * (
-            out.e_im[:, vb] - specs.q_spec[:, vb] + self.q_ctrl[vb]
+        # ---- (16c) unit q_g per voltage bus
+        B_vs = self.B_vs_idx
+        q_g = base * (
+            out.e_im[:, B_vs] - specs.q[:, B_vs] + self.q_ctrl[B_vs]
         )
 
         # ---- (16a) PQ voltages
-        v_pq = out.v_mag[:, self.dhelm.pq_idx]
+        v_q = out.v_abs[:, self.dhelm.B_q_idx]
 
         # ---- (16d)-(16e) line currents
-        i_from, i_to = self._line_currents(out.v_re, out.v_im)
+        i_f, i_t = self._line_currents(out.v_re, out.v_im)
 
         # ---- (5) cost and reward
-        p_gen = base * specs.p_gen
-        c0, c1, c2 = self.slack_cost
-        cost = (
-            (self.cp0 + self.cp1 * p_gen + self.cp2 * p_gen ** 2).sum(dim=1)
-            + c0 + c1 * p_slack + c2 * p_slack ** 2
+        p_g = base * specs.p_g
+        c0, c1, c2 = self.cp_s
+        f_sum = (
+            (self.cp0 + self.cp1 * p_g + self.cp2 * p_g ** 2).sum(dim=1)
+            + c0 + c1 * p_g_s + c2 * p_g_s ** 2
         )
-        reward = cfg.w0 - self.w_r * cost
+        r = cfg.w_0 - self.w_r * f_sum
 
         # ---- (6) violations
-        p_lo = torch.full_like(p_slack, self.p_slack_min)
-        p_hi = torch.full_like(p_slack, self.p_slack_max)
+        P_lo = torch.full_like(p_g_s, self.P_min_s)
+        P_hi = torch.full_like(p_g_s, self.P_max_s)
 
-        if p_slack_prev_mw is not None:
-            prev = torch.as_tensor(p_slack_prev_mw, dtype=DTYPE,
-                                   device=p_slack.device).reshape(-1)
-            if cfg.ramp_down_mw is not None:
-                p_lo = torch.maximum(p_lo, prev - cfg.ramp_down_mw)
-            if cfg.ramp_up_mw is not None:
-                p_hi = torch.minimum(p_hi, prev + cfg.ramp_up_mw)
+        if p_g_s_prev is not None:
+            prev = torch.as_tensor(p_g_s_prev, dtype=DTYPE,
+                                   device=p_g_s.device).reshape(-1)
+            if cfg.R_d is not None:
+                P_lo = torch.maximum(P_lo, prev - cfg.R_d)
+            if cfg.R_u is not None:
+                P_hi = torch.minimum(P_hi, prev + cfg.R_u)
 
-        eta_p = 1.0 / (self.p_slack_max - self.p_slack_min)
+        eta_p = 1.0 / (self.P_max_s - self.P_min_s)
 
         i_max = self.i_max
         li = self.line_idx
 
         z = torch.cat(
             [
-                violation(v_pq, self.v_lo, self.v_hi,
-                          1.0 / (self.v_hi - self.v_lo)),
-                violation(p_slack, p_lo, p_hi, eta_p).unsqueeze(1),
-                violation(q_bus, self.q_lo, self.q_hi,
-                          1.0 / (self.q_hi - self.q_lo)),
-                violation(i_from[:, li], -i_max, i_max, 0.5 / i_max),
-                violation(i_to[:, li], -i_max, i_max, 0.5 / i_max),
+                violation(v_q, self.v_min, self.v_max,
+                          1.0 / (self.v_max - self.v_min)),
+                violation(p_g_s, P_lo, P_hi, eta_p).unsqueeze(1),
+                violation(q_g, self.q_g_min, self.q_g_max,
+                          1.0 / (self.q_g_max - self.q_g_min)),
+                violation(i_f[:, li], -i_max, i_max, 0.5 / i_max),
+                violation(i_t[:, li], -i_max, i_max, 0.5 / i_max),
             ],
             dim=1,
         )
 
         return CriticOutput(
             helm=out,
-            p_gen_mw=p_gen,
-            p_slack_mw=p_slack,
-            q_bus_mvar=q_bus,
-            v_pq=v_pq,
-            i_from_ka=i_from,
-            i_to_ka=i_to,
-            cost=cost,
-            reward=reward,
+            p_g=p_g,
+            p_g_s=p_g_s,
+            q_g=q_g,
+            v_q=v_q,
+            i_f=i_f,
+            i_t=i_t,
+            f_sum=f_sum,
+            r=r,
             z=z,
         )
 
@@ -367,12 +369,12 @@ class DHELMCritic(torch.nn.Module):
 
         lines = [
             "D-HELM critic constraints (Eq. 6)",
-            f"  reward: r = {self.config.w0} - cost / {self.cost_max:.1f}",
+            f"  reward (Eq. 5): r = {self.config.w_0} - sum f_g / {self.f_max:.1f}",
         ]
         bounds = (
-            [(lo, hi) for lo, hi in zip(self.v_lo.tolist(), self.v_hi.tolist())]
-            + [(self.p_slack_min, self.p_slack_max)]
-            + [(lo, hi) for lo, hi in zip(self.q_lo.tolist(), self.q_hi.tolist())]
+            [(lo, hi) for lo, hi in zip(self.v_min.tolist(), self.v_max.tolist())]
+            + [(self.P_min_s, self.P_max_s)]
+            + [(lo, hi) for lo, hi in zip(self.q_g_min.tolist(), self.q_g_max.tolist())]
             + [(-i, i) for i in self.i_max.tolist()] * 2
         )
         for name, (lo, hi) in zip(self.constraint_names, bounds):

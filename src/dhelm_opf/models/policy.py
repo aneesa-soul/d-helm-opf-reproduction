@@ -34,14 +34,14 @@ from torch import nn
 
 class DHelmPolicy(nn.Module):
     """
-    LSTM policy producing normalized actions in [-1, 1].
+    LSTM policy producing a_hat = tanh(logit) in [-1, 1] (Eq. 18).
 
     Parameters
     ----------
     state_dim:
         Dimension of s_t (8 for 5-bus).
-    n_voltage, n_generator:
-        Action layout (ActionConfig.n_voltage / n_generator).
+    n_v, n_g:
+        Action layout (ActionConfig.n_v / n_g).
     state_low, state_high:
         Sampling ranges used to scale states to [-1, 1].
     hidden:
@@ -51,8 +51,8 @@ class DHelmPolicy(nn.Module):
     def __init__(
         self,
         state_dim: int,
-        n_voltage: int,
-        n_generator: int,
+        n_v: int,
+        n_g: int,
         state_low,
         state_high,
         hidden: int = 64,
@@ -61,10 +61,10 @@ class DHelmPolicy(nn.Module):
         super().__init__()
 
         self.state_dim = state_dim
-        self.n_voltage = n_voltage
-        self.n_generator = n_generator
-        self.action_dim = n_voltage + n_generator
-        self.input_dim = state_dim + n_generator
+        self.n_v = n_v
+        self.n_g = n_g
+        self.action_dim = n_v + n_g
+        self.input_dim = state_dim + n_g
 
         self.register_buffer(
             "state_low", torch.as_tensor(state_low, dtype=torch.float32)
@@ -79,27 +79,28 @@ class DHelmPolicy(nn.Module):
         self.out = nn.Linear(hidden, self.action_dim)
         self.act = nn.SELU()
 
-    def scale_state(self, state: torch.Tensor) -> torch.Tensor:
-        """Map sampling range -> [-1, 1]."""
+    def scale_state(self, s: torch.Tensor) -> torch.Tensor:
+        """Map the state's sampling range -> [-1, 1]."""
 
         return (
-            2.0 * (state - self.state_low)
+            2.0 * (s - self.state_low)
             / (self.state_high - self.state_low)
             - 1.0
         )
 
-    def step(self, state_t, prev_gen_action, hc=None):
+    def step(self, s_t, a_hat_g_prev, hc=None):
         """
         One time step.
 
-        state_t:          (B, state_dim)
-        prev_gen_action:  (B, n_generator) normalized, from step t-1
-        hc:               LSTM state or None
+        s_t:           (B, state_dim)  state s_t (Eq. 2)
+        a_hat_g_prev:  (B, n_g)        normalized p_g actions of step t-1
+        hc:            LSTM state or None
 
-        Returns (action_t (B, action_dim) in [-1, 1], new hc).
+        Returns (a_hat_t = tanh(logit_t), new hc); a_hat_t in [-1, 1]
+        is mapped to the physical action a_t by Eq. (18).
         """
 
-        x = torch.cat([self.scale_state(state_t), prev_gen_action], dim=1)
+        x = torch.cat([self.scale_state(s_t), a_hat_g_prev], dim=1)
 
         h, hc = self.lstm(x.unsqueeze(1), hc)
         h = h.squeeze(1)
@@ -107,36 +108,38 @@ class DHelmPolicy(nn.Module):
         h = self.act(self.fc1(h))
         h = self.act(self.fc2(h))
 
-        return torch.tanh(self.out(h)), hc
+        logit = self.out(h)
 
-    def forward(self, states: torch.Tensor, prev_gen_action=None):
+        return torch.tanh(logit), hc
+
+    def forward(self, s: torch.Tensor, a_hat_g_prev=None):
         """
         Run the policy over windows of states, autoregressively.
 
-        states:           (B, L, state_dim)  (or (B, state_dim) for L = 1)
-        prev_gen_action:  (B, n_generator) action before the window;
-                          zeros if None.
+        s:             (B, L, state_dim)  (or (B, state_dim) for L = 1)
+        a_hat_g_prev:  (B, n_g) p_g actions before the window;
+                       zeros if None.
 
-        Returns (B, L, action_dim) normalized actions.
+        Returns a_hat: (B, L, action_dim) normalized actions.
         """
 
-        if states.dim() == 2:
-            states = states.unsqueeze(1)
+        if s.dim() == 2:
+            s = s.unsqueeze(1)
 
-        states = states.to(self.state_low.dtype)
-        B, L, _ = states.shape
+        s = s.to(self.state_low.dtype)
+        B, L, _ = s.shape
 
-        if prev_gen_action is None:
-            prev = states.new_zeros(B, self.n_generator)
+        if a_hat_g_prev is None:
+            prev = s.new_zeros(B, self.n_g)
         else:
-            prev = prev_gen_action.to(states.dtype)
+            prev = a_hat_g_prev.to(s.dtype)
 
         hc = None
-        actions = []
+        a_hat = []
 
         for t in range(L):
-            a_t, hc = self.step(states[:, t], prev, hc)
-            actions.append(a_t)
-            prev = a_t[:, self.n_voltage:]
+            a_hat_t, hc = self.step(s[:, t], prev, hc)
+            a_hat.append(a_hat_t)
+            prev = a_hat_t[:, self.n_v:]
 
-        return torch.stack(actions, dim=1)
+        return torch.stack(a_hat, dim=1)

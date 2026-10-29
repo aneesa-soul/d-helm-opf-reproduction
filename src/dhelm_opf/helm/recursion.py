@@ -1,10 +1,21 @@
 """
-Holomorphic power-series recursion for AC power flow.
+Holomorphic power-series recursion for AC power flow (NumPy reference).
 
-This module implements the coefficient recursion used by a
-holomorphic embedding formulation of the AC power-flow equations.
+This module implements the coefficient recursion of the paper's
+holomorphic embedding (Eqs. 9-14, Algorithm 1).  It is intentionally
+independent of the RL policy and CPO algorithm, and serves as the
+reference ("oracle") for the differentiable PyTorch D-HELM.
 
-It is intentionally independent of the RL policy and CPO algorithm.
+Notation (see NOTATION.md):
+
+    alpha              embedding parameter (alpha = 0 no load, 1 full load)
+    v_i(alpha) = sum_n V_{i,n} alpha^n            (Eq. 10)
+    q_i(alpha) = sum_n Q_{i,n} alpha^n            (Eq. 10)
+    1/v_i*(alpha*) = sum_n W*_{i,n} (alpha*)^n    (Eq. 11)
+    A x_n = b_n,  x_n = [Re V_n, Im V_n, Q_n]     (Eq. 12)
+    R_n, U_n                                      (Eq. 13)
+
+Arrays are stored as V[n, i], W[n, i], Q[n, i] (order n first).
 """
 
 from __future__ import annotations
@@ -14,245 +25,231 @@ import numpy as np
 from dhelm_opf.helm.embedding import HelmProblem
 
 
-def initialize_voltage_series(
+def init_V(
     problem: HelmProblem,
-    order: int,
+    n_max: int,
 ) -> np.ndarray:
     """
-    Initialize the voltage power-series coefficients.
+    Initialize the voltage series coefficients V[n, i].
 
-    V(s) = V[0] + V[1]s + V[2]s^2 + ...
+    v(alpha) = V[0] + V[1] alpha + V[2] alpha^2 + ...
 
     The zeroth-order term is the paper's no-load germ:
 
-        V[i, 0] = 1  for every bus i   (W[i, 0] = 1, Q[i, 0] = 0)
+        V[0, i] = 1  for every bus i   (W[0, i] = 1, Q[0, i] = 0)
 
     It is NOT the slack voltage.  The specified slack voltage enters
-    through the slack row of R_n at n = 1 (V_slack,1 = v_slack - 1),
-    so that V_slack(s) = 1 + s (v_slack - 1) and V_slack(1) = v_slack.
-    Every other part of the recursion (W[0] = 1, the PV equation
-    U_1 = (|v_sp|^2 - 1) / 2) also assumes V[0] = 1.
-
-    Parameters
-    ----------
-    problem:
-        HELM problem definition.
-
-    order:
-        Highest coefficient to allocate.
+    through the slack row of R_n at n = 1 (V[1, s] = v_s - 1), so that
+    v_s(alpha) = 1 + alpha (v_s - 1) and v_s(1) = v_s.  Every other part
+    of the recursion (W[0] = 1, U_1 = (|v^sp|^2 - 1) / 2) also assumes
+    V[0] = 1.
 
     Returns
     -------
     numpy.ndarray
-        Complex voltage coefficient matrix with shape:
-
-            (order + 1, n_bus)
+        Complex array of shape (n_max + 1, n_bus).
     """
 
-    if order < 0:
-        raise ValueError("order must be non-negative.")
+    if n_max < 0:
+        raise ValueError("n_max must be non-negative.")
 
-    n_bus = problem.ybus.shape[0]
+    n_bus = problem.Y.shape[0]
 
-    coefficients = np.zeros(
-        (order + 1, n_bus),
+    V = np.zeros(
+        (n_max + 1, n_bus),
         dtype=np.complex128,
     )
 
-    coefficients[0, :] = 1.0 + 0.0j
+    V[0, :] = 1.0 + 0.0j
 
-    return coefficients
+    return V
 
 
 def initialize_conjugate_series(
-    voltage_coefficients: np.ndarray,
+    V: np.ndarray,
 ) -> np.ndarray:
     """
-    Initialize coefficients for the conjugate-voltage series.
-
-    If
-
-        V(s) = Σ V[k] s^k,
-
-    then the corresponding conjugate series is initialized as
-
-        W(s) = Σ conj(V[k]) s^k.
-
+    Coefficients of the conjugate series:  if v(alpha) = sum V[n] alpha^n
+    then its conjugate series has coefficients conj(V[n]).
     """
 
-    return np.conjugate(voltage_coefficients)
+    return np.conjugate(V)
 
-def update_inverse_voltage_series(
-    voltage_coefficients,
-    max_order,
+
+def compute_W(
+    V,
+    n_max,
 ):
     """
-    Compute inverse voltage-series coefficients W such that
+    Eq. (11): inverse-series coefficients W with v(alpha) W(alpha) = 1,
 
-        V(s) W(s) = 1.
+        W[0, i] = 1 / V[0, i]
+        W[n, i] = - sum_{m=1}^{n} V[m, i] W[n-m, i] / V[0, i],  n >= 1
 
     Parameters
     ----------
-    voltage_coefficients : ndarray
+    V : ndarray
         Shape (N+1, n_bus).
 
-    max_order : int
-        Highest inverse-series order required.
+    n_max : int
+        Highest order of W required.
 
     Returns
     -------
     W : ndarray
-        Inverse voltage-series coefficients.
+        Inverse voltage-series coefficients, same shape as V.
     """
 
-    max_available = voltage_coefficients.shape[0] - 1
+    n_available = V.shape[0] - 1
 
-    max_order = min(
-        max_order,
-        max_available,
+    n_max = min(
+        n_max,
+        n_available,
     )
 
-    n_bus = voltage_coefficients.shape[1]
+    n_bus = V.shape[1]
 
     W = np.zeros(
-        (max_available + 1, n_bus),
+        (n_available + 1, n_bus),
         dtype=complex,
     )
 
     # Zeroth coefficient
-    for bus in range(n_bus):
+    for i in range(n_bus):
 
-        if abs(voltage_coefficients[0, bus]) < 1e-14:
+        if abs(V[0, i]) < 1e-14:
             raise ValueError(
-                f"V(0) is zero at bus {bus}."
+                f"V[0] is zero at bus {i}."
             )
 
-        W[0, bus] = (
-            1.0 / voltage_coefficients[0, bus]
+        W[0, i] = (
+            1.0 / V[0, i]
         )
 
     # Higher-order coefficients
-    for order in range(1, max_order + 1):
+    for n in range(1, n_max + 1):
 
-        for bus in range(n_bus):
+        for i in range(n_bus):
 
             summation = 0.0 + 0.0j
 
-            for m in range(1, order + 1):
+            for m in range(1, n + 1):
 
                 summation += (
-                    voltage_coefficients[m, bus]
-                    * W[order - m, bus]
+                    V[m, i]
+                    * W[n - m, i]
                 )
 
-            W[order, bus] = (
+            W[n, i] = (
                 -summation
-                / voltage_coefficients[0, bus]
+                / V[0, i]
             )
 
     return W
 
-def build_coefficient_matrix(problem):
+
+def build_A(problem):
     """
-    Build the real-valued HELM coefficient matrix A.
+    Eq. (12): the real-valued coefficient matrix A.
 
-    The network admittance matrix is decomposed as:
+    The bus admittance matrix is decomposed as
 
-        Ybus = Ytr_raw + Ysh
+        Y = Y_tr + Y_sh
 
-    where:
-        Ytr_raw : transmission/network series contribution
-        Ysh     : diagonal shunt contribution
+    where
+        Y_tr : transmission matrix (row sums zero)
+        Y_sh : diagonal shunt part
 
-    The slack-bus row of Ytr_raw is then replaced by the
-    slack-voltage constraint before constructing A.
+    In A the slack-bus row of Y_tr is replaced by the slack-voltage
+    condition (Y_tr[s, j] = 0, Y_tr[s, s] = 1, paper below Eq. 12).
+
+            [ Re(Y_tr)  -Im(Y_tr)  0 ]
+        A = [ Im(Y_tr)   Re(Y_tr)  B ]
+            [   B^T         0      0 ]
+
+    with B[i, j] = 1 if bus i is the j-th PV bus.
 
     Returns
     -------
     A : ndarray
-        HELM coefficient matrix.
+        Coefficient matrix of Eq. (12).
 
-    y_tr_raw : ndarray
-        Transmission matrix before slack-row modification.
+    Y_tr : ndarray
+        Transmission matrix before the slack-row modification.
 
-    y_sh_diag : ndarray
-        Diagonal shunt admittance vector.
+    Y_sh : ndarray
+        Diagonal shunt admittance (vector).
     """
 
-    ybus = np.asarray(problem.ybus, dtype=complex)
+    Y = np.asarray(problem.Y, dtype=complex)
 
-    n_bus = problem.ybus.shape[0]
-    n_pv = len(problem.pv_buses)
-    slack = problem.slack_bus
+    n_bus = problem.Y.shape[0]
+    n_v = len(problem.B_v)
+    s = problem.B_s
 
     # ---------------------------------------------------------
-    # 1. Construct raw transmission matrix
+    # 1. Transmission matrix Y_tr (row sums zero)
     # ---------------------------------------------------------
-    y_tr_raw = np.zeros_like(ybus, dtype=complex)
+    Y_tr = np.zeros_like(Y, dtype=complex)
 
     for i in range(n_bus):
         for j in range(n_bus):
             if i != j:
-                y_tr_raw[i, j] = ybus[i, j]
+                Y_tr[i, j] = Y[i, j]
 
     for i in range(n_bus):
-        y_tr_raw[i, i] = -np.sum(y_tr_raw[i, :])
+        Y_tr[i, i] = -np.sum(Y_tr[i, :])
 
     # ---------------------------------------------------------
-    # 2. Extract shunt contribution
-    #
-    # Ybus = Ytr_raw + Ysh
+    # 2. Shunt part:  Y = Y_tr + Y_sh
     # ---------------------------------------------------------
-    y_sh = ybus - y_tr_raw
+    Y_sh_full = Y - Y_tr
 
     # The shunt contribution should be diagonal.
-    off_diag = y_sh.copy()
+    off_diag = Y_sh_full.copy()
     np.fill_diagonal(off_diag, 0.0)
 
     if not np.allclose(off_diag, 0.0, atol=1e-10):
         raise ValueError(
-            "Ysh is not diagonal. "
-            "Check the Ybus/transmission decomposition."
+            "Y_sh is not diagonal. "
+            "Check the Y / Y_tr decomposition."
         )
 
-    y_sh_diag = np.diag(y_sh)
+    Y_sh = np.diag(Y_sh_full)
 
     # ---------------------------------------------------------
-    # 3. Apply slack-bus constraint to transmission matrix
+    # 3. Slack row of Y_tr
     # ---------------------------------------------------------
-    y_tr = y_tr_raw.copy()
+    Y_tr_s = Y_tr.copy()
 
-    y_tr[slack, :] = 0.0
-    y_tr[slack, slack] = 1.0
+    Y_tr_s[s, :] = 0.0
+    Y_tr_s[s, s] = 1.0
 
     # ---------------------------------------------------------
-    # 4. PV-bus Q coefficient selector matrix B
+    # 4. PV selection matrix B
     # ---------------------------------------------------------
-    B = np.zeros((n_bus, n_pv), dtype=float)
+    B = np.zeros((n_bus, n_v), dtype=float)
 
-    for j, bus in enumerate(problem.pv_buses):
+    for j, bus in enumerate(problem.B_v):
         B[bus, j] = 1.0
 
     # ---------------------------------------------------------
-    # 5. Split complex Ytr into G + jH
+    # 5. Real and imaginary parts of Y_tr
     # ---------------------------------------------------------
-    G = np.real(y_tr)
-    H = np.imag(y_tr)
+    Y_tr_re = np.real(Y_tr_s)
+    Y_tr_im = np.imag(Y_tr_s)
 
     # ---------------------------------------------------------
-    # 6. HELM real coefficient matrix
-    #
-    #       [ G  -H   0 ]
-    # A =   [ H   G   B ]
-    #       [ Bᵀ  0   0 ]
+    # 6. A of Eq. (12)
     # ---------------------------------------------------------
     A = np.block([
-        [G,       -H,       np.zeros((n_bus, n_pv))],
-        [H,        G,        B],
-        [B.T, np.zeros((n_pv, n_bus)), np.zeros((n_pv, n_pv))]
+        [Y_tr_re, -Y_tr_im, np.zeros((n_bus, n_v))],
+        [Y_tr_im,  Y_tr_re, B],
+        [B.T, np.zeros((n_v, n_bus)), np.zeros((n_v, n_v))]
     ])
 
-    return A, y_tr_raw, y_sh_diag
+    return A, Y_tr, Y_sh
+
 
 def compute_series_product(
     a: np.ndarray,
@@ -260,16 +257,8 @@ def compute_series_product(
     k: int,
 ) -> complex:
     """
-    Compute the kth coefficient of a Cauchy product.
-
-    For
-
-        A(s) = Σ a[k] s^k
-        B(s) = Σ b[k] s^k,
-
-    the kth coefficient of A(s)B(s) is
-
-        Σ_{m=0}^{k} a[m] b[k-m].
+    k-th coefficient of a Cauchy product:  for A(alpha) = sum a[k] alpha^k
+    and B(alpha) = sum b[k] alpha^k, returns sum_{m=0}^{k} a[m] b[k-m].
     """
 
     if k < 0:
@@ -288,36 +277,30 @@ def compute_series_product(
 
 def build_embedding_rhs(
     problem: HelmProblem,
-    order: int,
+    n_max: int,
 ) -> np.ndarray:
     """
-    Construct the embedded complex-power right-hand side.
+    Embedded complex-power right-hand side, alpha * e_sp: the
+    injection enters at first order in alpha (Eq. 9).
 
-    The power-flow equation is represented through a formal
-    embedding parameter s.
-
-    At s = 0, the system corresponds to the no-load/no-injection
-    reference state.
-
-    At s = 1, the full specified operating condition is recovered.
+    At alpha = 0 the system is the no-load reference state; at
+    alpha = 1 the full specified operating condition is recovered.
 
     Returns
     -------
     numpy.ndarray
-        Complex RHS coefficients with shape:
-
-            (order + 1, n_bus)
+        Complex array of shape (n_max + 1, n_bus).
     """
 
-    n_bus = problem.ybus.shape[0]
+    n_bus = problem.Y.shape[0]
 
     rhs = np.zeros(
-        (order + 1, n_bus),
+        (n_max + 1, n_bus),
         dtype=np.complex128,
     )
 
-    if order >= 1:
-        rhs[1, :] = problem.s_spec
+    if n_max >= 1:
+        rhs[1, :] = problem.e_sp
 
     return rhs
 
@@ -326,12 +309,7 @@ def solve_linear_system(
     matrix: np.ndarray,
     rhs: np.ndarray,
 ) -> np.ndarray:
-    """
-    Solve a complex linear system.
-
-    A dedicated helper keeps the numerical operation isolated from
-    the coefficient bookkeeping.
-    """
+    """Solve a complex linear system."""
 
     matrix = np.asarray(matrix, dtype=np.complex128)
     rhs = np.asarray(rhs, dtype=np.complex128)
@@ -340,341 +318,330 @@ def solve_linear_system(
 
 
 def enforce_slack_coefficient(
-    coefficients: np.ndarray,
+    V: np.ndarray,
     problem: HelmProblem,
 ) -> None:
     """
     Enforce the slack-bus voltage series implied by the paper's
     embedding with the no-load germ:
 
-        V_slack(s) = 1 + s (v_slack - 1)
+        v_s(alpha) = 1 + alpha (v_s - 1)
 
     therefore:
 
-        V_slack[0] = 1
-        V_slack[1] = v_slack - 1
-        V_slack[k] = 0,  k > 1
+        V[0, s] = 1
+        V[1, s] = v_s - 1
+        V[n, s] = 0,  n > 1
 
     The linear solve already produces these values through the slack
     row of R_n; this function only removes round-off.
     """
 
-    slack = problem.slack_bus
+    s = problem.B_s
 
-    coefficients[0, slack] = 1.0 + 0.0j
+    V[0, s] = 1.0 + 0.0j
 
-    if coefficients.shape[0] > 1:
-        coefficients[1, slack] = problem.v_slack - 1.0
+    if V.shape[0] > 1:
+        V[1, s] = problem.v_s - 1.0
 
-    if coefficients.shape[0] > 2:
-        coefficients[2:, slack] = 0.0
+    if V.shape[0] > 2:
+        V[2:, s] = 0.0
 
 
 def validate_series(
-    coefficients: np.ndarray,
+    V: np.ndarray,
     problem: HelmProblem,
 ) -> None:
     """
     Validate basic properties of a voltage coefficient series.
     """
 
-    if coefficients.ndim != 2:
+    if V.ndim != 2:
         raise ValueError(
-            "Voltage coefficients must have shape "
-            "(order + 1, n_bus)."
+            "V must have shape (n + 1, n_bus)."
         )
 
-    n_bus = problem.ybus.shape[0]
+    n_bus = problem.Y.shape[0]
 
-    if coefficients.shape[1] != n_bus:
+    if V.shape[1] != n_bus:
         raise ValueError(
             f"Expected {n_bus} buses, "
-            f"got {coefficients.shape[1]}."
+            f"got {V.shape[1]}."
         )
 
-    slack = problem.slack_bus
+    s = problem.B_s
 
-    if not np.allclose(coefficients[0, :], 1.0):
+    if not np.allclose(V[0, :], 1.0):
         raise ValueError(
             "Zeroth-order coefficients must equal the no-load "
             "germ V[0] = 1 at every bus."
         )
 
-    if coefficients.shape[0] > 1 and not np.isclose(
-        np.sum(coefficients[:, slack]),
-        problem.v_slack,
+    if V.shape[0] > 1 and not np.isclose(
+        np.sum(V[:, s]),
+        problem.v_s,
     ):
         raise ValueError(
             "Slack voltage series does not sum to the "
-            "specified reference voltage."
+            "specified slack voltage."
         )
 
-def build_RU_vectors(
+
+def build_R_U(
     problem,
-    order,
-    voltage_coefficients,
-    inverse_voltage_coefficients,
-    active_power,
-    reactive_power_coefficients,
-    y_sh_diag,
+    n,
+    V,
+    W,
+    P,
+    Q,
+    Y_sh,
 ):
     """
-    Build the HELM R_n and U_n coefficient vectors.
+    Eq. (13): build R_n (all buses) and U_n (PV buses), including the
+    - Y_sh V_{n-1} term of b_n (Eq. 12).
+
+        PQ  : R_{i,n} = conj(e_i^sp) conj(W_{i,n-1}) - Y_sh,i V_{i,n-1}
+        PV  : R_{i,n} = P_i conj(W_{i,n-1})
+                        - j sum_{m=1}^{n-1} Q_{i,m} conj(W_{i,n-m})
+                        - Y_sh,i V_{i,n-1}
+        slack: R_{s,1} = |v_s^sp| - 1,  R_{s,n} = 0 for n > 1
+
+        U_{i,1} = (|v_i^sp|^2 - 1) / 2
+        U_{i,n} = - sum_{m=1}^{n-1} Re(conj(V_{i,m}) V_{i,n-m}) / 2,  n > 1
 
     Parameters
     ----------
-    problem : HELMProblem
-        HELM problem definition.
-
-    order : int
-        Current series order n.
-
-    voltage_coefficients : ndarray
-        Shape (order+1, n_bus).
-
-    inverse_voltage_coefficients : ndarray
-        Voltage inverse-series coefficients W.
-
-    active_power : ndarray
-        Specified active-power injections in p.u.
-
-    reactive_power_coefficients : ndarray
-        Shape (order+1, n_bus).
-
-    y_sh_diag : ndarray
-        Diagonal shunt admittance in p.u.
+    problem : HelmProblem
+    n : int            current series order
+    V, W : ndarray     series coefficients up to order n-1
+    P : ndarray        specified active injection Re(e^sp), p.u.
+    Q : ndarray        reactive series coefficients Q[n, i]
+    Y_sh : ndarray     diagonal shunt admittance, p.u.
 
     Returns
     -------
-    R_n : ndarray
-        Complex RHS vector for the voltage equations.
-
-    U_n : ndarray
-        Real RHS vector for the PV voltage-magnitude equations.
+    R_n : ndarray      complex, shape (n_bus,)
+    U_n : ndarray      real, shape (|B_v|,)
     """
 
-    n_bus = problem.ybus.shape[0]
-    n_pv = len(problem.pv_buses)
-    slack = problem.slack_bus
+    n_bus = problem.Y.shape[0]
+    n_v = len(problem.B_v)
+    s = problem.B_s
 
     R_n = np.zeros(n_bus, dtype=complex)
-    U_n = np.zeros(n_pv, dtype=float)
+    U_n = np.zeros(n_v, dtype=float)
 
     pv_position = {
         bus: idx
-        for idx, bus in enumerate(problem.pv_buses)
+        for idx, bus in enumerate(problem.B_v)
     }
 
     # =========================================================
-    # PQ and PV bus equations
+    # R_n: PQ, PV and slack rows
     # =========================================================
-    for bus in range(n_bus):
+    for i in range(n_bus):
 
         # -----------------------------------------------------
         # Slack bus
+        #
+        # Paper: |v_s^sp| - 1 at n = 1.  Using the complex value
+        # is identical when the slack angle is 0 (the paper's
+        # reference) and stays correct for a non-zero angle.
         # -----------------------------------------------------
-        if bus == slack:
+        if i == s:
 
-            # Paper: |v_sp| - 1 at n = 1.  Using the complex value
-            # is identical when the slack angle is 0 (the paper's
-            # reference) and stays correct for a non-zero angle.
-            if order == 1:
-                R_n[bus] = problem.v_slack - 1.0
+            if n == 1:
+                R_n[i] = problem.v_s - 1.0
             else:
-                R_n[bus] = 0.0
+                R_n[i] = 0.0
 
             continue
 
         # -----------------------------------------------------
         # PQ bus
-        #
-        # R(i,n) =
-        #   conj(S_spec(i)) conj(W(i,n-1))
-        #   - Ysh(i) V(i,n-1)
         # -----------------------------------------------------
-        if bus not in pv_position:
+        if i not in pv_position:
 
-            s_spec = problem.s_spec[bus]
+            e_sp_i = problem.e_sp[i]
 
-            R_n[bus] = (
-                np.conjugate(s_spec)
-                * np.conjugate(inverse_voltage_coefficients[order - 1, bus])
-                - y_sh_diag[bus]
-                * voltage_coefficients[order - 1, bus]
+            R_n[i] = (
+                np.conjugate(e_sp_i)
+                * np.conjugate(W[n - 1, i])
+                - Y_sh[i]
+                * V[n - 1, i]
             )
 
         # -----------------------------------------------------
         # PV bus
-        #
-        # R(i,n) =
-        #   P(i) conj(W(i,n-1))
-        #   - j Σ Q(i,m) conj(W(i,n-m))
-        #   - Ysh(i) V(i,n-1)
         # -----------------------------------------------------
         else:
 
-            r_value = (
-                active_power[bus]
+            R_value = (
+                P[i]
                 * np.conjugate(
-                    inverse_voltage_coefficients[order - 1, bus]
+                    W[n - 1, i]
                 )
             )
 
-            if order > 1:
+            if n > 1:
 
                 q_sum = 0.0 + 0.0j
 
-                for m in range(1, order):
+                for m in range(1, n):
 
                     q_sum += (
-                        reactive_power_coefficients[m, bus]
+                        Q[m, i]
                         * np.conjugate(
-                            inverse_voltage_coefficients[
-                                order - m, bus
-                            ]
+                            W[n - m, i]
                         )
                     )
 
-                r_value -= 1j * q_sum
+                R_value -= 1j * q_sum
 
-            r_value -= (
-                y_sh_diag[bus]
-                * voltage_coefficients[order - 1, bus]
+            R_value -= (
+                Y_sh[i]
+                * V[n - 1, i]
             )
 
-            R_n[bus] = r_value
+            R_n[i] = R_value
 
     # =========================================================
-    # PV voltage-magnitude equations
+    # U_n: PV voltage-magnitude equations
     # =========================================================
-    for bus in problem.pv_buses:
+    for i in problem.B_v:
 
-        position = pv_position[bus]
+        position = pv_position[i]
 
-        if order == 1:
+        if n == 1:
 
-            voltage_setpoint = problem.voltage_setpoints[bus]
+            v_sp_i = problem.v_sp[i]
 
             U_n[position] = (
-                voltage_setpoint**2 - 1.0
+                v_sp_i**2 - 1.0
             ) / 2.0
 
         else:
 
-            voltage_sum = 0.0
+            v_sum = 0.0
 
-            for m in range(1, order):
+            for m in range(1, n):
 
-                voltage_sum += np.real(
+                v_sum += np.real(
                     np.conjugate(
-                        voltage_coefficients[m, bus]
+                        V[m, i]
                     )
-                    * voltage_coefficients[
-                        order - m, bus
+                    * V[
+                        n - m, i
                     ]
                 )
 
-            U_n[position] = -0.5 * voltage_sum
+            U_n[position] = -0.5 * v_sum
 
     return R_n, U_n
 
-def solve_coefficient_order(
+
+def solve_x_n(
     problem,
-    order,
-    voltage_coefficients,
-    inverse_voltage_coefficients,
-    reactive_power_coefficients,
+    n,
+    V,
+    W,
+    Q,
     A,
-    y_sh_diag,
+    Y_sh,
 ):
     """
-    Solve one HELM series coefficient order.
+    Solve one order of Eq. (12):  A x_n = b_n,
+
+        b_n = [Re(R_n - Y_sh V_{n-1}), Im(R_n - Y_sh V_{n-1}), U_n]
+        x_n = [Re(V_n), Im(V_n), Q_n]
 
     Returns
     -------
-    voltage_n : ndarray
-        Complex voltage coefficient V(n).
+    V_n : ndarray
+        Complex voltage coefficient of order n.
 
-    q_n : ndarray
-        Reactive-power coefficient Q(n), stored by bus index.
+    Q_n : ndarray
+        Reactive-power coefficient of order n, stored by bus index
+        (zero outside B_v).
     """
 
-    active_power = np.real(problem.s_spec)
+    P = np.real(problem.e_sp)
 
-    R_n, U_n = build_RU_vectors(
+    R_n, U_n = build_R_U(
         problem=problem,
-        order=order,
-        voltage_coefficients=voltage_coefficients,
-        inverse_voltage_coefficients=inverse_voltage_coefficients,
-        active_power=active_power,
-        reactive_power_coefficients=reactive_power_coefficients,
-        y_sh_diag=y_sh_diag,
+        n=n,
+        V=V,
+        W=W,
+        P=P,
+        Q=Q,
+        Y_sh=Y_sh,
     )
 
-    rhs = np.concatenate([
+    b_n = np.concatenate([
         np.real(R_n),
         np.imag(R_n),
         U_n,
     ])
 
-    solution = np.linalg.solve(A, rhs)
+    x_n = np.linalg.solve(A, b_n)
 
-    n_bus = problem.ybus.shape[0]
-    n_pv = len(problem.pv_buses)
+    n_bus = problem.Y.shape[0]
+    n_v = len(problem.B_v)
 
-    voltage_n = (
-        solution[:n_bus]
-        + 1j * solution[n_bus:2 * n_bus]
+    V_n = (
+        x_n[:n_bus]
+        + 1j * x_n[n_bus:2 * n_bus]
     )
 
-    q_n = np.zeros(n_bus, dtype=float)
+    Q_n = np.zeros(n_bus, dtype=float)
 
-    q_n[list(problem.pv_buses)] = (
-        solution[2 * n_bus:2 * n_bus + n_pv]
+    Q_n[list(problem.B_v)] = (
+        x_n[2 * n_bus:2 * n_bus + n_v]
     )
 
-    return voltage_n, q_n
+    return V_n, Q_n
+
 
 def eq14_mismatch(
     problem: HelmProblem,
-    voltage: np.ndarray,
+    v: np.ndarray,
 ) -> float:
     """
     Largest mismatch of the paper's termination conditions (14a)-(14c).
 
-        (14a)  | |v_i| - |v_i^sp| |      for PV buses
-        (14b)  | e_i - e_i^sp |          for PQ buses (complex P + jQ)
-        (14c)  | Re(e_i) - Re(e_i^sp) |  for PV buses
+        (14a)  | |v_i| - |v_i^sp| |        i in B_v   (tolerance epsilon)
+        (14b)  | e_i - e_i^sp |            i in B_q   (complex p + jq)
+        (14c)  | Re(e_i) - Re(e_i^sp) |    i in B_v
 
-    where e_i = v_i * sum_j conj(Y_ij v_j) is evaluated with the full
-    Ybus at the partial-sum voltage V(1) = sum_n V_n.
+    where e_i = v_i * sum_j conj(Y_ij v_j) is evaluated with the full Y
+    at the partial-sum voltage v = sum_n V_n (alpha = 1).
 
     The slack bus is excluded: its voltage is fixed by construction
     and its P/Q are outputs of the critic, not specifications.
     """
 
-    voltage = np.asarray(voltage, dtype=np.complex128)
+    v = np.asarray(v, dtype=np.complex128)
 
-    injection = voltage * np.conjugate(problem.ybus @ voltage)
+    e = v * np.conjugate(problem.Y @ v)
 
     mismatches = [0.0]
 
-    for bus in problem.pq_buses:
+    for i in problem.B_q:
         mismatches.append(
-            abs(injection[bus] - problem.s_spec[bus])
+            abs(e[i] - problem.e_sp[i])
         )
 
-    for bus in problem.pv_buses:
+    for i in problem.B_v:
         mismatches.append(
             abs(
-                abs(voltage[bus])
-                - problem.voltage_setpoints[bus]
+                abs(v[i])
+                - problem.v_sp[i]
             )
         )
         mismatches.append(
             abs(
-                injection[bus].real
-                - problem.s_spec[bus].real
+                e[i].real
+                - problem.e_sp[i].real
             )
         )
 
@@ -683,459 +650,235 @@ def eq14_mismatch(
 
 def solve_helm_series(
     problem,
-    max_order=30,
-    tol=1e-5,
-    min_order=1,
+    n_max=30,
+    epsilon=1e-5,
+    n_min=1,
 ):
     """
-    Solve the HELM embedded power-flow problem
-    by recursively computing voltage-series coefficients.
+    Algorithm 1: compute series terms until the Eq. (14) mismatches are
+    within epsilon (or n_max is reached).
 
     Parameters
     ----------
-    problem : HELMProblem
-        HELM problem definition.
+    problem : HelmProblem
 
-    max_order : int
-        Maximum number of series coefficients
-        (paper, Algorithm 1: n_max = 30).
+    n_max : int
+        Maximum number of series terms (Algorithm 1 / Table 1: 30).
 
-    tol : float
-        Tolerance on the Eq. (14a)-(14c) mismatches at the
-        partial sum V(1) (paper, Algorithm 1: 1e-5).
+    epsilon : float
+        Tolerance on the Eq. (14a)-(14c) mismatches at alpha = 1
+        (Table 1: epsilon = varepsilon = 1e-5).
 
-    min_order : int
-        Minimum number of orders before convergence
-        can be declared.
+    n_min : int
+        Minimum number of terms before convergence can be declared.
 
     Returns
     -------
     result : dict
-        Dictionary containing the HELM solution and
-        convergence information.
+        V, W, Q        series coefficients
+        v              complex voltage at alpha = 1
+        v_abs, theta   magnitude (p.u.) and angle (degrees)
+        e              complex injection e_i = v_i sum_j conj(Y_ij v_j)
+        A, Y_tr, Y_sh  matrices of Eq. (12)
+        converged, N   convergence flag and number of terms used
+        increment_history, mismatch_history
     """
 
-    n_bus = problem.ybus.shape[0]
+    n_bus = problem.Y.shape[0]
 
     # =========================================================
     # 1. Allocate coefficient arrays
     # =========================================================
 
-    V_coeff = initialize_voltage_series(
+    V = init_V(
         problem,
-        max_order,
+        n_max,
     )
 
-    W_coeff = np.zeros(
-        (max_order + 1, n_bus),
+    W = np.zeros(
+        (n_max + 1, n_bus),
         dtype=complex,
     )
 
-    Q_coeff = np.zeros(
-        (max_order + 1, n_bus),
+    Q = np.zeros(
+        (n_max + 1, n_bus),
         dtype=float,
     )
 
     # =========================================================
-    # 2. Build HELM coefficient matrix and shunt vector
+    # 2. Coefficient matrix A and shunt vector Y_sh (Eq. 12)
     # =========================================================
 
-    A, y_tr_raw, y_sh_diag = build_coefficient_matrix(
+    A, Y_tr, Y_sh = build_A(
         problem
     )
 
     # =========================================================
-    # 3. Previous partial voltage for convergence test
+    # 3. Previous partial sum, for the increment diagnostic
     # =========================================================
 
-    V_previous = np.sum(
-        V_coeff[:1, :],
+    v_previous = np.sum(
+        V[:1, :],
         axis=0,
     )
 
-    convergence_history = []
+    increment_history = []
     mismatch_history = []
 
     converged = False
-    orders_used = 0
+    N = 0
 
     # =========================================================
-    # 4. Recursive coefficient calculation
+    # 4. Recursion (Algorithm 1, steps 2-4)
     # =========================================================
 
-    for order in range(1, max_order + 1):
+    for n in range(1, n_max + 1):
 
-        # -----------------------------------------------------
-        # Compute inverse voltage series coefficients up to
-        # order - 1.
-        # -----------------------------------------------------
-        W_coeff = update_inverse_voltage_series(
-            V_coeff,
-            order - 1,
+        # Eq. (11): W up to order n - 1.
+        W = compute_W(
+            V,
+            n - 1,
         )
 
-        # -----------------------------------------------------
-        # Solve current coefficient order.
-        # -----------------------------------------------------
-        V_n, Q_n = solve_coefficient_order(
+        # Eq. (12)-(13): solve order n.
+        V_n, Q_n = solve_x_n(
             problem=problem,
-            order=order,
-            voltage_coefficients=V_coeff,
-            inverse_voltage_coefficients=W_coeff,
-            reactive_power_coefficients=Q_coeff,
+            n=n,
+            V=V,
+            W=W,
+            Q=Q,
             A=A,
-            y_sh_diag=y_sh_diag,
+            Y_sh=Y_sh,
         )
 
-        # -----------------------------------------------------
-        # Store coefficients.
-        # -----------------------------------------------------
-        V_coeff[order, :] = V_n
-        Q_coeff[order, :] = Q_n
+        V[n, :] = V_n
+        Q[n, :] = Q_n
 
-        # -----------------------------------------------------
-        # Enforce slack coefficient.
-        # -----------------------------------------------------
         enforce_slack_coefficient(
-            V_coeff,
+            V,
             problem,
         )
 
-        # -----------------------------------------------------
-        # Partial series evaluated at s = 1.
-        #
-        # V(1) ≈ Σ V(n)
-        # -----------------------------------------------------
-        V_current = np.sum(
-            V_coeff[:order + 1, :],
+        # Partial sum at alpha = 1:  v = sum_n V_n
+        v_current = np.sum(
+            V[:n + 1, :],
             axis=0,
         )
 
-        # -----------------------------------------------------
-        # Convergence measures.
-        #
         # increment : size of the newest term (diagnostic only)
         # mismatch  : paper's termination test, Eq. (14a)-(14c)
-        # -----------------------------------------------------
         increment = np.max(
-            np.abs(V_current - V_previous)
+            np.abs(v_current - v_previous)
         )
 
-        mismatch = eq14_mismatch(problem, V_current)
+        mismatch = eq14_mismatch(problem, v_current)
 
-        convergence_history.append(increment)
+        increment_history.append(increment)
         mismatch_history.append(mismatch)
 
-        orders_used = order
+        N = n
 
-        # -----------------------------------------------------
         # Algorithm 1, step 4: terminate when (14) holds.
-        # -----------------------------------------------------
-        if order >= min_order and mismatch <= tol:
+        if n >= n_min and mismatch <= epsilon:
             converged = True
             break
 
-        V_previous = V_current
+        v_previous = v_current
 
     # =========================================================
-    # 5. Final inverse series
+    # 5. Final W, v, |v|, theta and e
     # =========================================================
 
-    W_coeff = update_inverse_voltage_series(
-        V_coeff,
-        orders_used,
+    W = compute_W(
+        V,
+        N,
     )
 
-    # =========================================================
-    # 6. Final voltage estimate
-    # =========================================================
-
-    voltage = np.sum(
-        V_coeff[:orders_used + 1, :],
+    v = np.sum(
+        V[:N + 1, :],
         axis=0,
     )
 
-    # =========================================================
-    # 7. Voltage magnitude and angle
-    # =========================================================
+    v_abs = np.abs(v)
 
-    voltage_magnitude = np.abs(voltage)
-
-    voltage_angle = np.angle(
-        voltage,
+    theta = np.angle(
+        v,
         deg=True,
     )
 
-    # =========================================================
-    # 8. Calculate resulting complex power injections
-    # =========================================================
-
-    injections = compute_bus_injections(
+    e = compute_e(
         problem,
-        voltage,
+        v,
     )
 
-    active_power = np.real(injections)
-    reactive_power = np.imag(injections)
-
-    # =========================================================
-    # 9. Return complete result
-    # =========================================================
-
     return {
-        "voltage_coefficients": V_coeff,
-        "inverse_voltage_coefficients": W_coeff,
-        "reactive_power_coefficients": Q_coeff,
+        "V": V,
+        "W": W,
+        "Q": Q,
 
-        "voltage": voltage,
-        "voltage_magnitude": voltage_magnitude,
-        "voltage_angle": voltage_angle,
+        "v": v,
+        "v_abs": v_abs,
+        "theta": theta,
 
-        "active_power": active_power,
-        "reactive_power": reactive_power,
+        "e": e,
 
         "A": A,
-        "y_tr_raw": y_tr_raw,
-        "y_sh_diag": y_sh_diag,
+        "Y_tr": Y_tr,
+        "Y_sh": Y_sh,
 
         "converged": converged,
-        "orders_used": orders_used,
-        "convergence_history": np.asarray(
-            convergence_history
+        "N": N,
+        "increment_history": np.asarray(
+            increment_history
         ),
         "mismatch_history": np.asarray(
             mismatch_history
         ),
     }
 
-def solve_helm_coefficient(
+
+def compute_e(
     problem: HelmProblem,
-    coefficient_matrix: np.ndarray,
-    voltage_coefficients: np.ndarray,
-    inverse_voltage_coefficients: np.ndarray,
-    order: int,
-    active_power: np.ndarray,
-    reactive_power_coefficients: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Solve the HELM linear system for one coefficient order.
-
-    Implements the coefficient solve
-
-        A x_n =
-            [ Re(R_n) ]
-            [ Im(R_n) ]
-            [    U_n  ]
-
-    where
-
-        x_n =
-            [ Re(V_n) ]
-            [ Im(V_n) ]
-            [    Q_n  ]
-
-    Eq. (12) provides A and Eq. (13) provides R_n and U_n.
-
-    Parameters
-    ----------
-    problem:
-        HELM problem definition.
-
-    coefficient_matrix:
-        Constant coefficient matrix A from Eq. (12).
-
-    voltage_coefficients:
-        Voltage series coefficients calculated up to the
-        current order.
-
-    inverse_voltage_coefficients:
-        Inverse-voltage series coefficients calculated up to
-        the current order.
-
-    order:
-        Coefficient order n being solved.
-
-    active_power:
-        Specified active-power vector.
-
-    reactive_power_coefficients:
-        Reactive-power coefficient matrix.
-
-    Returns
-    -------
-    voltage_n:
-        Complex voltage coefficient V_n.
-
-    reactive_power_n:
-        Reactive-power coefficient Q_n for the PV buses.
-    """
-
-    if order < 1:
-        raise ValueError(
-            "HELM coefficient order must be >= 1."
-        )
-
-    n_bus = problem.ybus.shape[0]
-    n_pv = len(problem.pv_buses)
-
-    expected_size = 2 * n_bus + n_pv
-
-    coefficient_matrix = np.asarray(
-        coefficient_matrix,
-        dtype=float,
-    )
-
-    if coefficient_matrix.shape != (
-        expected_size,
-        expected_size,
-    ):
-        raise ValueError(
-            "Coefficient matrix must have shape "
-            f"({expected_size}, {expected_size}), "
-            f"got {coefficient_matrix.shape}."
-        )
-
-    # ------------------------------------------------------------
-    # Eq. (13)
-    # ------------------------------------------------------------
-
-    R_n, U_n = build_RU_vectors(
-        problem=problem,
-        voltage_coefficients=voltage_coefficients,
-        inverse_voltage_coefficients=inverse_voltage_coefficients,
-        order=order,
-        active_power=active_power,
-        reactive_power_coefficients=reactive_power_coefficients,
-    )
-
-    # ------------------------------------------------------------
-    # Construct RHS of Eq. (12)
-    #
-    #       [ Re(R_n) ]
-    # b_n = [ Im(R_n) ]
-    #       [   U_n   ]
-    # ------------------------------------------------------------
-
-    rhs = np.concatenate(
-        [
-            R_n.real,
-            R_n.imag,
-            U_n,
-        ]
-    )
-
-    # ------------------------------------------------------------
-    # Solve
-    #
-    # A x_n = b_n
-    # ------------------------------------------------------------
-
-    print("\n" + "=" * 60)
-    print("HELM LINEAR SYSTEM DIAGNOSTIC")
-    print("=" * 60)
-
-    print("order:", order)
-    print("matrix shape:", coefficient_matrix.shape)
-    print("matrix rank:", np.linalg.matrix_rank(coefficient_matrix))
-    print("matrix condition number:", np.linalg.cond(coefficient_matrix))
-    print("matrix determinant:", np.linalg.det(coefficient_matrix))
-
-    print("\nRHS:")
-    print(rhs)
-
-    print("\nCoefficient matrix:")
-    print(coefficient_matrix)
-    
-    x_n = np.linalg.solve(
-        coefficient_matrix,
-        rhs,
-    )
-
-    # ------------------------------------------------------------
-    # Extract V_n
-    #
-    # x_n =
-    #
-    # [ Re(V_n) ]
-    # [ Im(V_n) ]
-    # [   Q_n   ]
-    # ------------------------------------------------------------
-
-    voltage_n = (
-        x_n[:n_bus]
-        + 1j * x_n[n_bus:2 * n_bus]
-    )
-
-    # ------------------------------------------------------------
-    # Extract Q_n
-    # ------------------------------------------------------------
-
-    reactive_power_n = (
-        x_n[2 * n_bus:]
-    )
-
-    return voltage_n, reactive_power_n
-
-def compute_bus_injections(
-    problem: HelmProblem,
-    voltage: np.ndarray,
+    v: np.ndarray,
 ) -> np.ndarray:
     """
-    Compute complex bus power injections from the solved
-    HELM voltage vector.
+    Complex bus injections from the solved voltage (Algorithm 1, step 3):
 
-    Implements the physical power-injection calculation used
-    in Algorithm 1 of the D-HELM paper:
+        e_i = v_i * sum_j conj(Y_ij) conj(v_j)
 
-        e_i = V_i * sum_j conj(Y_ij) * conj(V_j)
-
-    Parameters
-    ----------
-    problem:
-        HELM problem containing the full network admittance matrix.
-
-    voltage:
-        Complex bus-voltage vector evaluated at s = 1.
-
-    Returns
-    -------
-    np.ndarray
-        Complex bus-injection vector e.
-
-        Real part  = active-power injection P
-        Imaginary part = reactive-power injection Q
+    Real part = active injection p_i, imaginary part = reactive q_i.
     """
 
-    ybus = np.asarray(
-        problem.ybus,
+    Y = np.asarray(
+        problem.Y,
         dtype=np.complex128,
     )
 
-    voltage = np.asarray(
-        voltage,
+    v = np.asarray(
+        v,
         dtype=np.complex128,
     )
 
-    n_bus = ybus.shape[0]
+    n_bus = Y.shape[0]
 
-    if voltage.shape != (n_bus,):
+    if v.shape != (n_bus,):
         raise ValueError(
-            f"voltage must have shape ({n_bus},), "
-            f"got {voltage.shape}."
+            f"v must have shape ({n_bus},), "
+            f"got {v.shape}."
         )
 
-    injections = np.zeros(
+    e = np.zeros(
         n_bus,
         dtype=np.complex128,
     )
 
     for i in range(n_bus):
-        injections[i] = (
-            voltage[i]
+        e[i] = (
+            v[i]
             * np.sum(
-                np.conjugate(ybus[i, :])
-                * np.conjugate(voltage)
+                np.conjugate(Y[i, :])
+                * np.conjugate(v)
             )
         )
 
-    return injections
+    return e

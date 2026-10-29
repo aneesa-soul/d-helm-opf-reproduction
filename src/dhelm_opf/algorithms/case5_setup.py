@@ -53,12 +53,12 @@ def make_case5_agent(
     dhelm = DHelmNetwork(net, action_config, uncertainty, solver_config)
     critic = DHELMCritic(dhelm, net, critic_config)
 
-    sampler = StateSampler(dhelm.n_load, dhelm.n_wind, uncertainty, seed=seed)
+    sampler = StateSampler(dhelm.n_d, dhelm.n_w, uncertainty, seed=seed)
 
     policy = DHelmPolicy(
         state_dim=dhelm.state_dim,
-        n_voltage=action_config.n_voltage,
-        n_generator=action_config.n_generator,
+        n_v=action_config.n_v,
+        n_g=action_config.n_g,
         state_low=sampler.low,
         state_high=sampler.high,
         hidden=hidden,

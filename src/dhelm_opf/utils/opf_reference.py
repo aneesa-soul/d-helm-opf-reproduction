@@ -77,15 +77,15 @@ def opf_network(
     """Case5 with the state's demand and wind, prepared for the OPF."""
 
     net = build_case5()
-    n_load = len(net.load)
+    n_d = len(net.load)
 
     scenario = OperatingScenario(
-        state[0:n_load], state[n_load:2 * n_load], state[2 * n_load:]
+        state[0:n_d], state[n_d:2 * n_d], state[2 * n_d:]
     )
     apply_demand_uncertainty(net, scenario)
     with contextlib.redirect_stdout(io.StringIO()):
-        apply_wind_output(net, unc.wind_buses, scenario.wind_scale,
-                          unc.wind_rated_mw)
+        apply_wind_output(net, unc.B_w, scenario.p_w_scale,
+                          unc.p_w_rated_mw)
 
     unrated = net.line["max_i_ka"] >= 1e4
     net.line.loc[unrated, "max_loading_percent"] = np.nan
@@ -111,11 +111,11 @@ def solve_opf(net: pp.pandapowerNet) -> bool:
 def opf_as_action(net: pp.pandapowerNet, config: ActionConfig) -> np.ndarray:
     """The OPF solution expressed in the normalized action space."""
 
-    v = [net.res_bus.at[b, "vm_pu"] for b in config.voltage_buses]
-    p = [net[f"res_{u.table}"].at[u.index, "p_mw"] for u in config.generators]
+    v = [net.res_bus.at[b, "vm_pu"] for b in config.B_vs]
+    p = [net[f"res_{u.table}"].at[u.index, "p_mw"] for u in config.G_ns]
 
-    v_lo, v_hi = np.array(config.voltage_min), np.array(config.voltage_max)
-    p_lo, p_hi = config.generator_p_min_mw, config.generator_p_max_mw
+    v_lo, v_hi = np.array(config.v_min), np.array(config.v_max)
+    p_lo, p_hi = config.P_min, config.P_max
 
     a = np.concatenate([
         2 * (np.array(v) - v_lo) / (v_hi - v_lo) - 1,

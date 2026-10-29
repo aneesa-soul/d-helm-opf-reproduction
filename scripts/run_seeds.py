@@ -134,7 +134,7 @@ def main() -> None:
             agent, meta = loaded[key]
 
             refine = None if mode == "none" else RefineConfig(
-                mode=mode, steps=k, lr=args.refine_lr)
+                mode=mode, K=k, lr=args.refine_lr)
 
             res = evaluate_policy(agent, states, meta["args"]["window"],
                                   ref, refine)

@@ -50,22 +50,22 @@ def main() -> None:
     # ------------------------------------------------------------
     problem = build_helm_problem_from_network(net)
 
-    n_bus = problem.ybus.shape[0]
+    n_bus = problem.Y.shape[0]
 
     print("\nHELM problem:")
     print(f"  number of buses : {n_bus}")
-    print(f"  slack bus       : {problem.slack_bus}")
-    print(f"  PV buses        : {problem.pv_buses}")
-    print(f"  PQ buses        : {problem.pq_buses}")
-    print(f"  slack voltage   : {problem.v_slack}")
+    print(f"  slack bus       : {problem.B_s}")
+    print(f"  PV buses        : {problem.B_v}")
+    print(f"  PQ buses        : {problem.B_q}")
+    print(f"  slack voltage   : {problem.v_s}")
 
     # ------------------------------------------------------------
     # 4. Solve HELM
     # ------------------------------------------------------------
     config = HelmSolverConfig(
-        max_order=30,
-        tolerance=1e-8,
-        min_order=3,
+        n_max=30,
+        epsilon=1e-8,
+        n_min=3,
     )
 
     solution = solve_helm(
@@ -77,22 +77,22 @@ def main() -> None:
     for bus in range(n_bus):
         print(
             f"  Bus {bus}: "
-            f"V = {solution.voltage[bus]: .10f}, "
-            f"|V| = {solution.voltage_magnitude[bus]:.10f}, "
-            f"angle = {solution.voltage_angle[bus]:.10f} deg"
+            f"V = {solution.v[bus]: .10f}, "
+            f"|V| = {solution.v_abs[bus]:.10f}, "
+            f"angle = {solution.theta[bus]:.10f} deg"
         )
 
     print("\nHELM solution:")
     print(f"  converged : {solution.converged}")
-    print(f"  order     : {solution.order}")
-    print(f"  residual  : {solution.residual:.6e}")
+    print(f"  order     : {solution.N}")
+    print(f"  mismatch  : {solution.mismatch:.6e}")
 
     # ------------------------------------------------------------
     # 5. Compare HELM voltage with AC reference
     # ------------------------------------------------------------
-    v_helm = solution.voltage
-    vm_helm = solution.voltage_magnitude
-    angle_helm = solution.voltage_angle
+    v_helm = solution.v
+    vm_helm = solution.v_abs
+    angle_helm = solution.theta
 
     complex_voltage_error = np.max(
         np.abs(v_helm - v_ac_complex)
@@ -128,8 +128,8 @@ def main() -> None:
     for bus in range(n_bus):
         print(
             f"  Bus {bus}: "
-            f"P = {solution.active_power[bus]: .8f} pu, "
-            f"Q = {solution.reactive_power[bus]: .8f} pu"
+            f"P = {solution.e.real[bus]: .8f} pu, "
+            f"Q = {solution.e.imag[bus]: .8f} pu"
         )
 
     # ------------------------------------------------------------
@@ -137,7 +137,7 @@ def main() -> None:
     # ------------------------------------------------------------
     print("\nHELM convergence history:")
 
-    for order, error in enumerate(solution.convergence_history, start=1):
+    for order, error in enumerate(solution.increment_history, start=1):
         print(f"  order {order:2d}: {error:.6e}")
 
 

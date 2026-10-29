@@ -55,8 +55,10 @@ def parse_args(argv=None):
     p.add_argument("--window", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--eta-lambda", type=float, default=1.0)
-    p.add_argument("--lambda-max", type=float, default=1000.0)
+    p.add_argument("--eta-lam", type=float, default=1.0,
+                   help="eta_lam, Eq. (20)")
+    p.add_argument("--lam-max", type=float, default=1000.0,
+                   help="lam_max, Eq. (20)")
     p.add_argument("--eval-size", type=int, default=256)
     p.add_argument("--eval-every", type=int, default=5)
     p.add_argument("--lr-schedule", choices=("constant", "cosine"),
@@ -86,8 +88,8 @@ def main(argv=None) -> Path:
         lr=args.lr,
         batch_size=args.batch_size,
         window=args.window,
-        eta_lambda=args.eta_lambda,
-        lambda_max=args.lambda_max,
+        eta_lam=args.eta_lam,
+        lam_max=args.lam_max,
     )
 
     agent = make_case5_agent(seed=args.seed, cpo_config=cpo_config)
@@ -105,7 +107,7 @@ def main(argv=None) -> Path:
     # states used by evaluate_vs_opf.py (seed 20000).  They draw the
     # learning curves and select the best checkpoint.
     eval_sampler = StateSampler(
-        agent.dhelm.n_load, agent.dhelm.n_wind, agent.uncertainty,
+        agent.dhelm.n_d, agent.dhelm.n_w, agent.uncertainty,
         seed=10_000 + args.seed,
     )
     eval_states = eval_sampler.sample(args.eval_size * args.window).reshape(
@@ -127,9 +129,9 @@ def main(argv=None) -> Path:
     def snapshot(m):
         return {
             "policy": copy.deepcopy(agent.policy.state_dict()),
-            "lambdas": cpo.lambdas.clone(),
+            "lam": cpo.lam.clone(),
             "step": m["step"],
-            "cost": m["cost"],
+            "f_sum": m["f_sum"],
             "feasible": m["feasible"],
             "loss": m["loss"],
         }
@@ -143,7 +145,7 @@ def main(argv=None) -> Path:
 
         if step > 0:
             if m["feasible"] >= args.best_feasible and (
-                best["feasible"] is None or m["cost"] < best["feasible"]["cost"]
+                best["feasible"] is None or m["f_sum"] < best["feasible"]["f_sum"]
             ):
                 best["feasible"] = snapshot(m)
             if best["loss"] is None or m["loss"] < best["loss"]["loss"]:
@@ -153,10 +155,10 @@ def main(argv=None) -> Path:
     def report(m, episode=None):
         if args.quiet:
             return
-        tail = (f"  max lambda {cpo.lambdas.max().item():7.2f}  (episode {episode})"
+        tail = (f"  max lam {cpo.lam.max().item():7.2f}  (episode {episode})"
                 if episode else "")
-        print(f"step {m['step']:4d}  reward {m['reward']:.4f}  "
-              f"cost {m['cost']:8.1f}  violation {m['violation']:.4f}  "
+        print(f"step {m['step']:4d}  r {m['r']:.4f}  "
+              f"f_sum {m['f_sum']:8.1f}  z_sum {m['z_sum']:.4f}  "
               f"feasible {m['feasible']:.2f}{tail}")
 
     m = log(0, 0)
@@ -191,7 +193,7 @@ def main(argv=None) -> Path:
     }
 
     torch.save(
-        {"policy": agent.policy.state_dict(), "lambdas": cpo.lambdas,
+        {"policy": agent.policy.state_dict(), "lam": cpo.lam,
          "step": step, **common},
         out_dir / "policy.pt",
     )
@@ -204,14 +206,14 @@ def main(argv=None) -> Path:
         chosen, criterion = best["loss"], "lowest validation loss (fallback)"
 
     torch.save(
-        {"policy": chosen["policy"], "lambdas": chosen["lambdas"],
+        {"policy": chosen["policy"], "lam": chosen["lam"],
          "step": chosen["step"], "criterion": criterion, **common},
         out_dir / "policy_best.pt",
     )
 
     summary = {
-        "last": {k: rows[-1][k] for k in ("step", "cost", "feasible", "loss")},
-        "best": {k: chosen[k] for k in ("step", "cost", "feasible", "loss")},
+        "last": {k: rows[-1][k] for k in ("step", "f_sum", "feasible", "loss")},
+        "best": {k: chosen[k] for k in ("step", "f_sum", "feasible", "loss")},
         "best_criterion": criterion,
         "seconds": time.perf_counter() - start,
     }
@@ -225,9 +227,9 @@ def main(argv=None) -> Path:
     plot(rows, agent.critic.constraint_names, out_dir / "training.png", name,
          best_step=chosen["step"])
 
-    print(f"{name}: last step {step} cost {rows[-1]['cost']:.1f} "
+    print(f"{name}: last step {step} f_sum {rows[-1]['f_sum']:.1f} "
           f"feasible {rows[-1]['feasible']:.2f} | best step {chosen['step']} "
-          f"cost {chosen['cost']:.1f} feasible {chosen['feasible']:.2f} "
+          f"f_sum {chosen['f_sum']:.1f} feasible {chosen['feasible']:.2f} "
           f"| saved to {out_dir}/ ({time.perf_counter() - start:.1f} s)")
 
     return out_dir
@@ -257,11 +259,11 @@ def plot(rows, names, path, title, best_step=None):
 
     fig, axes = plt.subplots(2, 3, figsize=(12, 6.5), facecolor=SURFACE)
     panels = [
-        ("reward", "Reward (Eq. 5)", None),
-        ("cost", "Operating cost ($/h)", None),
-        ("violation", "Total violation  Σz (Eq. 6)", None),
+        ("r", "Reward r (Eq. 5)", None),
+        ("f_sum", "Operating cost  Σ f_g(p_g)  ($/h)", None),
+        ("z_sum", "Total violation  Σz (Eq. 6)", None),
         ("feasible", "Feasible share of validation states", (0, 1.02)),
-        ("helm_terms", "D-HELM terms N", None),
+        ("N", "D-HELM terms N", None),
     ]
 
     for ax, (key, label, ylim) in zip(axes.flat, panels):
@@ -269,7 +271,7 @@ def plot(rows, names, path, title, best_step=None):
         ax.set_title(label, color=INK, fontsize=10, loc="left")
         if ylim:
             ax.set_ylim(*ylim)
-        if best_step is not None and key in ("cost", "feasible"):
+        if best_step is not None and key in ("f_sum", "feasible"):
             ax.axvline(best_step, color=INK_2, lw=1, ls="--")
             ax.annotate("best", (best_step, 1.0), xycoords=("data", "axes fraction"),
                         xytext=(3, -10), textcoords="offset points",
@@ -277,7 +279,7 @@ def plot(rows, names, path, title, best_step=None):
 
     # Multipliers: the three that grew most, plus a legend.
     ax = axes.flat[5]
-    lam = {n: col(f"lambda/{n}") for n in names}
+    lam = {n: col(f"lam/{n}") for n in names}
     top = sorted(names, key=lambda n: lam[n][-1], reverse=True)[:3]
     for color, n in zip(SERIES, top):
         ax.plot(steps, lam[n], color=color, lw=2, label=n)

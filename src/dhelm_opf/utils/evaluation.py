@@ -37,12 +37,19 @@ def load_agent(run_dir: str | Path, checkpoint: str = "best"):
     ckpt = torch.load(path, weights_only=False)
     args = ckpt["args"]
 
+    # Checkpoints written before the rename to paper symbols use the
+    # old configuration keys; map them so old runs still load.
+    renamed = {"lambda_init": "lam_0", "eta_lambda": "eta_lam",
+               "lambda_max": "lam_max"}
+    cpo_config = {renamed.get(k, k): v for k, v in ckpt["cpo_config"].items()}
+    lam = ckpt["lam"] if "lam" in ckpt else ckpt["lambdas"]
+
     agent = make_case5_agent(
-        seed=args["seed"], cpo_config=CPOConfig(**ckpt["cpo_config"])
+        seed=args["seed"], cpo_config=CPOConfig(**cpo_config)
     )
     agent.policy.load_state_dict(ckpt["policy"])
     agent.policy.eval()
-    agent.cpo.lambdas = ckpt["lambdas"].to(torch.float64)
+    agent.cpo.lam = lam.to(torch.float64)
 
     return agent, ckpt
 
@@ -50,7 +57,7 @@ def load_agent(run_dir: str | Path, checkpoint: str = "best"):
 def test_states(agent: Case5Agent, n: int = 100, seed: int = TEST_SEED):
     """The held-out test states (same draw for every run)."""
 
-    sampler = StateSampler(agent.dhelm.n_load, agent.dhelm.n_wind,
+    sampler = StateSampler(agent.dhelm.n_d, agent.dhelm.n_w,
                            agent.uncertainty, seed=seed)
     return sampler.sample(n)
 
@@ -68,7 +75,7 @@ def check_opf_reference(agent: Case5Agent, ref: dict) -> dict:
                            torch.as_tensor(ref["action"][ok]))
     return {
         "opf_converged": int(ok.sum()),
-        "cost_mismatch_max": float(np.max(np.abs(out.cost.numpy()
+        "cost_mismatch_max": float(np.max(np.abs(out.f_sum.numpy()
                                                  - ref["cost"][ok]))),
         "violation_max": float(out.z.sum(dim=1).max()),
     }
@@ -99,17 +106,17 @@ def evaluate_policy(
         ev = agent.cpo.evaluate(windows)
     t_policy = time.perf_counter() - t0
 
-    actions = ev.actions.reshape(S, -1).to(torch.float64)
-    cost = ev.cost.numpy()
+    a_hat = ev.a_hat.reshape(S, -1).to(torch.float64)
+    cost = ev.f_sum.numpy()
     z = ev.z.numpy()
     t_refine = 0.0
     n_refined = 0
     steps_mean = 0.0
 
     if refine is not None:
-        r = refine_actions(agent.critic, agent.cpo.lambdas,
-                           torch.as_tensor(states), actions, refine)
-        actions, cost, z = r.actions, r.cost.numpy(), r.z.numpy()
+        r = refine_actions(agent.critic, agent.cpo.lam,
+                           torch.as_tensor(states), a_hat, refine)
+        a_hat, cost, z = r.a_hat, r.f_sum.numpy(), r.z.numpy()
         t_refine = r.seconds
         n_refined = int(r.refined.sum())
         steps_mean = float(r.steps_taken[r.refined].double().mean()) if n_refined else 0.0
@@ -146,7 +153,7 @@ def evaluate_policy(
 
     per_state = {
         "cost": cost, "opf_cost": opf, "gap": gap, "violation": viol,
-        "z": z, "actions": np.asarray(actions),
+        "z": z, "a_hat": np.asarray(a_hat),
     }
 
     return {"summary": summary, "per_state": per_state}
