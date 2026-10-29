@@ -50,7 +50,8 @@ def main() -> None:
     p.add_argument("--refine-K", type=int, default=20,
                    help="refinement step budget K")
     p.add_argument("--refine-lr", type=float, default=0.03)
-    p.add_argument("--n-states", type=int, default=100)
+    p.add_argument("--n-states", type=int, default=1000,
+                   help="test states (a multiple of the window)")
     p.add_argument("--seed", type=int, default=TEST_SEED)
     p.add_argument("--fixed-slack-voltage", action="store_true",
                    help="pandapower default: hold the slack at its setpoint")
@@ -63,10 +64,13 @@ def main() -> None:
 
     states = test_states(agent, args.n_states, args.seed)
 
-    cache = args.opf_cache or opf_cache_path(args.n_states, args.seed,
-                                             args.fixed_slack_voltage)
+    ramp = agent.dhelm.ramp
+    cache = args.opf_cache or opf_cache_path(
+        args.n_states, args.seed, args.fixed_slack_voltage,
+        ramp=ramp, episode_length=window)
     ref = load_or_compute(cache, states, agent.uncertainty,
-                          agent.action_config, args.fixed_slack_voltage)
+                          agent.action_config, args.fixed_slack_voltage,
+                          ramp=ramp, episode_length=window)
     check = check_opf_reference(agent, ref)
 
     refine = None
@@ -85,7 +89,8 @@ def main() -> None:
     print("=" * 68)
     print(f"{run_dir.name}  |  checkpoint {args.checkpoint} "
           f"(step {ckpt.get('step', '?')})  |  refinement {label}")
-    print(f"{s['states']} test states, window {window}, OPF slack voltage "
+    print(f"{s['states']} test states, window {window}, ramp "
+          f"{ckpt['args'].get('ramp_frac') or 'off'}, OPF slack voltage "
           f"{'fixed' if args.fixed_slack_voltage else 'optimized (matches policy)'}")
     print("=" * 68)
     print(f"OPF converged                 : {check['opf_converged']}/{s['states']}")
@@ -104,6 +109,13 @@ def main() -> None:
         print(f"Refined states                : {s['refined_states']} "
               f"(mean {s['refine_steps_mean']:.1f} steps)")
     print()
+    if "ramp_bind_step_share" in s:
+        print(f"Ramp limits bind (t > 0)      : policy {s['ramp_bind_step_share']:.1%} "
+              f"of steps / {s['ramp_bind_unit_share']:.1%} of unit-steps"
+              + (f";  OPF {s['opf_ramp_bind_step_share']:.1%} / "
+                 f"{s['opf_ramp_bind_unit_share']:.1%}"
+                 if "opf_ramp_bind_step_share" in s else ""))
+        print()
     print(f"Time policy, all states       : {s['ms_policy_total']:.1f} ms")
     if refine is not None:
         print(f"Time refinement, all states   : {s['ms_refine_total']:.1f} ms")

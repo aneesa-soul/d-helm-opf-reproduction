@@ -80,10 +80,14 @@ class ActionConfig:
     """
     Layout and physical bounds of the policy action.
 
-    Action layout
-    -------------
-    a[0 : n_v]          |v_i|, i in B_vs = B_v ∪ B_s   (bounds v_min, v_max)
-    a[n_v : n_v + n_g]  p_g,   g in G_ns = G / G_s     (bounds P_min, P_max)
+    Action layout (p_first = True, the order of Eq. 4)
+    -------------------------------------------------
+    a[0 : n_g]          p_g,   g in G_ns = G / G_s     (bounds P_min, P_max)
+    a[n_g : n_g + n_v]  |v_i|, i in B_vs = B_v ∪ B_s   (bounds v_min, v_max)
+
+    p_first = False gives the voltage-first layout used before the
+    paper-protocol update; it is kept so earlier checkpoints decode
+    correctly.
 
     The slack unit G_s is not an action; its p_g and q_g are outputs
     of the critic (paper Eqs. 15-16).  Its limits and cost are kept
@@ -98,6 +102,9 @@ class ActionConfig:
     G_s: GeneratorUnit
 
     base_mva: float
+
+    # Eq. (4) order: p_g first, then |v_i|.
+    p_first: bool = True
 
     def __post_init__(self) -> None:
 
@@ -151,11 +158,15 @@ class ActionConfig:
 
     @property
     def voltage_action_indices(self) -> Tuple[int, ...]:
-        return tuple(range(self.n_v))
+        """Positions of the |v_i| actions in a."""
+        start = self.n_g if self.p_first else 0
+        return tuple(range(start, start + self.n_v))
 
     @property
     def generator_action_indices(self) -> Tuple[int, ...]:
-        return tuple(range(self.n_v, self.action_dim))
+        """Positions of the p_g actions in a."""
+        start = 0 if self.p_first else self.n_v
+        return tuple(range(start, start + self.n_g))
 
     # ------------------------------------------------------------------
     # Bound vectors (convenient for the decoder / critic)
@@ -177,30 +188,32 @@ class ActionConfig:
         lines = [
             "D-HELM OPF action configuration (derived from network)",
             "",
-            f"Action dimension : {self.n_v} voltage "
-            f"+ {self.n_g} generator P = {self.action_dim}",
+            f"Action dimension : {self.n_g} p_g "
+            f"+ {self.n_v} |v| = {self.action_dim}  "
+            f"({'Eq. 4 order: p_g first' if self.p_first else 'voltage first'})",
             "",
-            "Voltage setpoints:",
         ]
 
-        for k, (bus, vmin, vmax) in enumerate(
-            zip(self.B_vs, self.v_min, self.v_max)
+        v_lines = ["|v_i| setpoints (B_v ∪ B_s):"]
+        for k, bus, vmin, vmax in zip(
+            self.voltage_action_indices, self.B_vs, self.v_min, self.v_max
         ):
             kind = "slack" if bus == self.G_s.bus else "PV"
-            lines.append(
+            v_lines.append(
                 f"  a[{k}]  bus {bus} ({kind:5s})  "
                 f"[{vmin:.2f}, {vmax:.2f}] p.u."
             )
 
-        lines.append("")
-        lines.append("Generator active-power setpoints:")
-
+        p_lines = ["p_g setpoints (G / G_s):"]
         for k, unit in zip(self.generator_action_indices, self.G_ns):
-            lines.append(
+            p_lines.append(
                 f"  a[{k}]  {unit.label:15s}  "
                 f"[{unit.P_min:.1f}, {unit.P_max:.1f}] MW  "
                 f"cost {unit.cp1:.1f} $/MWh"
             )
+
+        blocks = (p_lines, v_lines) if self.p_first else (v_lines, p_lines)
+        lines += blocks[0] + [""] + blocks[1]
 
         lines.append("")
         lines.append(
@@ -210,6 +223,34 @@ class ActionConfig:
         )
 
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class RampConfig:
+    """
+    Ramp limits R_u, R_d of Eq. (3) / (16b), per step.
+
+    The paper includes ramping (Eqs. 3 and 16b) but gives no ramp rates
+    for the test systems, so the rates are a reproduction choice:
+    R_u = frac_u * P_max and R_d = frac_d * P_max for every unit, the
+    slack included.  Default 30% of P_max per step (see
+    REPRODUCTION_STATUS.md for the reasoning).
+    """
+
+    frac_u: float = 0.30
+    frac_d: float = 0.30
+
+    def __post_init__(self) -> None:
+        if not (0.0 < self.frac_u and 0.0 < self.frac_d):
+            raise ValueError("Ramp fractions must be positive.")
+
+    def R_u(self, unit: "GeneratorUnit") -> float:
+        """R^u_g in MW per step."""
+        return self.frac_u * unit.P_max
+
+    def R_d(self, unit: "GeneratorUnit") -> float:
+        """R^d_g in MW per step."""
+        return self.frac_d * unit.P_max
 
 
 # ----------------------------------------------------------------------
@@ -278,9 +319,14 @@ def is_wind_sgen(net: pp.pandapowerNet, index: int) -> bool:
     return str(net.sgen.at[index, "type"]) == WIND_SGEN_TYPE
 
 
-def action_config_from_network(net: pp.pandapowerNet) -> ActionConfig:
+def action_config_from_network(
+    net: pp.pandapowerNet,
+    p_first: bool = True,
+) -> ActionConfig:
     """
     Derive the action layout, limits and costs from the network.
+
+    p_first=True uses the Eq. (4) order (p_g, then |v_i|).
 
     Generators are ordered by bus, with `gen` units before `sgen`
     units on the same bus.
@@ -346,4 +392,5 @@ def action_config_from_network(net: pp.pandapowerNet) -> ActionConfig:
         G_ns=tuple(units),
         G_s=slack,
         base_mva=float(net.sn_mva),
+        p_first=p_first,
     )

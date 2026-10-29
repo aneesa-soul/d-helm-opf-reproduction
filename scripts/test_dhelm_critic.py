@@ -6,7 +6,8 @@ Validate the D-HELM critic (Eqs. 15, 16, 6, 5).
 2. Violations z (Eq. 6) and reward (Eq. 5) vs an independent NumPy
    computation that reads the limits straight from the network tables.
    Random actions over the full range, so many constraints are violated.
-3. Ramping (16b) with a configured ramp rate.
+3. Ramping (16b) with a configured ramp rate (RampConfig, 5% of
+   the 200 MW slack = 10 MW/step).
 4. gradcheck of reward and z w.r.t. action and state.
 
 Run:
@@ -31,7 +32,7 @@ from dhelm_opf.environment.uncertainty import (
 )
 from dhelm_opf.helm.differentiable import DHelmNetwork
 from dhelm_opf.helm.solver import HelmSolverConfig
-from dhelm_opf.models.action_config import action_config_from_network
+from dhelm_opf.models.action_config import RampConfig, action_config_from_network
 from dhelm_opf.models.action_decoder import (
     ActionDecoder,
     apply_action_to_network,
@@ -203,9 +204,11 @@ def test_vs_reference(critic, config, rng, batch=100):
 
 def test_ramping(dhelm, net, rng):
 
-    critic = DHELMCritic(
-        dhelm, net, CriticConfig(R_u=10.0, R_d=10.0)
-    )
+    ramped = DHelmNetwork(net, dhelm.action_config, UNC,
+                          HelmSolverConfig(n_max=60, epsilon=1e-10),
+                          ramp=RampConfig(frac_u=0.05, frac_d=0.05))
+    critic = DHELMCritic(ramped, net)
+    assert np.isclose(ramped.R_u_s, 10.0) and np.isclose(ramped.R_d_s, 10.0)
 
     # Find a sample whose slack output is well inside [0, 200] MW.
     for _ in range(200):

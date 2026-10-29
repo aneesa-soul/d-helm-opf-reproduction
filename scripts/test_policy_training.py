@@ -35,7 +35,9 @@ def test_policy(agent) -> None:
 
     # Step t must use the generator part of the action at t-1.
     a0, hc = policy.step(states[:, 0], torch.zeros(6, 4))
-    a1, _ = policy.step(states[:, 1], a0[:, 4:], hc)
+    idx_p = list(agent.action_config.generator_action_indices)
+    assert idx_p == [0, 1, 2, 3]           # Eq. (4): p_g first
+    a1, _ = policy.step(states[:, 1], a0[:, idx_p], hc)
     assert torch.allclose(a1, actions[:, 1], atol=1e-6)
 
     print("  1. policy shapes / range / feedback : OK (input 12, output 8)")

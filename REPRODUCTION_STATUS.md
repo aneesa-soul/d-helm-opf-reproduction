@@ -142,6 +142,8 @@ Two further checks support this mapping:
 
 The ordering of the four generator actions (by bus, then `gen` before `sgen`) is a reproduction convention, because the paper does not list one.
 
+The action vector follows Eq. (4): a = [p_g of G_ns, |v| of B_vs], generator powers first. Runs trained before this change used voltages first; their checkpoints have no `p_first` entry and load with the old layout (`p_first=False`).
+
 Validation: `scripts/test_action_config.py` and `scripts/test_action_decoder.py`. The decoder test also confirms that HELM matches pandapower (max error 5×10⁻¹¹) over 50 random actions with random uncertainty.
 
 ### 7. Physics-driven critic (`models/dhelm_critic.py`)
@@ -167,7 +169,7 @@ Reproduction choices and interpretations:
 * **Q limits are per bus (Eq. 16c literally).** A bus limit is the sum of the limits of the controllable units on it. Bus 0 (gen0 ±30 and sgen0 ±127.5) therefore has ±157.5 MVAr. This also matches how pandapower's OPF treats a controllable sgen.
 * **η_n = 1 / (x̄_n − x̲_n)** is our reading of Table 1's "η = (Z_max − Z_min)⁻¹". For line currents the bounds of Eqs. (16d)–(16e) are −i … i, so η = 1 / (2 i_max).
 * **w_r = 1 / f_max** is our reading of Table 1's "w_r = cost1max". Here f_max = Σ f_g(P̄_g) over all units, slack included, which is 32,710 $/h. With w₀ = 2 the reward lies roughly in [1, 2].
-* **Ramping (16b) is implemented but off by default.** The case data has no ramp rates, and the paper's states are sampled independently, with no time series. `CriticConfig.R_u` / `R_d` and the critic input `p_g_s_prev` enable it.
+* **Ramping (Eq. 3, 16b) is on in the paper protocol** (Section 10). The paper states ramp limits but gives no rates, and the case data has none, so R_u = R_d = 30% of P_max per step is our choice (`RampConfig`). Non-slack units are ramp-limited through the action mapping (the Eq. 18 window is the Eq. 3 window), the slack through the 16b penalty. With `ramp=None` the code reproduces the earlier no-ramp runs bit for bit.
 * **Lines with no rating have no current constraint.** In case5, lines 1–4 have pandapower's placeholder max_i_ka = 99,999 kA, which comes from MATPOWER rateA = 0.
 
 Validation (`scripts/test_dhelm_critic.py`), on 100 random samples over the full action range:

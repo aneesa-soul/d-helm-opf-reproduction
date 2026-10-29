@@ -46,6 +46,10 @@ class DHelmPolicy(nn.Module):
         Sampling ranges used to scale states to [-1, 1].
     hidden:
         Width of the LSTM and dense layers (Table 1: 64 for 5-bus).
+    idx_p:
+        Positions of the p_g actions in the output (ActionConfig.
+        generator_action_indices).  Default: after the voltages (the
+        pre-Eq.-4 layout).
     """
 
     def __init__(
@@ -56,6 +60,7 @@ class DHelmPolicy(nn.Module):
         state_low,
         state_high,
         hidden: int = 64,
+        idx_p=None,
     ) -> None:
 
         super().__init__()
@@ -65,6 +70,7 @@ class DHelmPolicy(nn.Module):
         self.n_g = n_g
         self.action_dim = n_v + n_g
         self.input_dim = state_dim + n_g
+        self.idx_p = list(idx_p) if idx_p is not None else list(range(n_v, n_v + n_g))
 
         self.register_buffer(
             "state_low", torch.as_tensor(state_low, dtype=torch.float32)
@@ -140,6 +146,6 @@ class DHelmPolicy(nn.Module):
         for t in range(L):
             a_hat_t, hc = self.step(s[:, t], prev, hc)
             a_hat.append(a_hat_t)
-            prev = a_hat_t[:, self.n_v:]
+            prev = a_hat_t[:, self.idx_p]
 
         return torch.stack(a_hat, dim=1)

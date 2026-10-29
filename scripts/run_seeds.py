@@ -4,8 +4,14 @@ against the same cached OPF reference.
 
 For each seed:
     train          scripts/train_dhelm_case5.py (skipped if the run exists)
-    evaluate       last checkpoint, best checkpoint, and the best
-                   checkpoint refined with R1 / R2 at several budgets K
+    evaluate       the last (trained) checkpoint, alone and refined
+                   with R1 / R2 at several budgets K, plus the best
+                   checkpoint for reference
+
+Defaults = the paper protocol (see train_dhelm_case5.py): 20 episodes
+x 25 steps, window 25, ramping 30% of P_max.  With ramping the test set
+is n_states / 25 episodes and the OPF reference is a sequence of
+ramp-limited OPFs per episode (utils/opf_reference.py).
 
 Outputs (results/experiments/<name>/):
     per_seed.csv   one row per (seed, variant)
@@ -13,9 +19,13 @@ Outputs (results/experiments/<name>/):
     summary.png    gap and feasibility per variant, one dot per seed
 
 Examples:
-    python scripts/run_seeds.py --name paper_2500 --episodes 100
-    python scripts/run_seeds.py --name paper_5000 --episodes 200
-    python scripts/run_seeds.py --name cosine_2500 --episodes 100 --lr-schedule cosine
+    # paper protocol, both OPF references
+    python scripts/run_seeds.py --name paper_protocol
+    python scripts/run_seeds.py --name paper_protocol --fixed-slack-voltage
+    # the earlier extended runs (window 1, no ramping, old layout)
+    python scripts/run_seeds.py --name paper_5000 --episodes 200 --window 1 \
+        --ramp-frac 0 --voltage-first --n-states 100 \
+        --variants last,best,best+r1:20,best+r2:5,best+r2:20,best+r2:50,best+r2:200
 """
 
 from __future__ import annotations
@@ -67,21 +77,26 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--name", required=True)
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
-    p.add_argument("--episodes", type=int, default=100)
-    p.add_argument("--window", type=int, default=1)
+    p.add_argument("--episodes", type=int, default=20)
+    p.add_argument("--window", type=int, default=25)
+    p.add_argument("--ramp-frac", type=float, default=0.3)
+    p.add_argument("--voltage-first", action="store_true")
+    p.add_argument("--fixed-slack-voltage", action="store_true",
+                   help="OPF reference holds the slack voltage at its setpoint")
     p.add_argument("--lr-schedule", choices=("constant", "cosine"),
                    default="constant")
     p.add_argument("--variants", type=str,
-                   default="last,best,best+r1:20,best+r2:5,best+r2:20,"
-                           "best+r2:50,best+r2:200")
+                   default="last,last+r1:20,last+r2:5,last+r2:20,"
+                           "last+r2:50,last+r2:200,best")
     p.add_argument("--refine-lr", type=float, default=0.03)
-    p.add_argument("--n-states", type=int, default=100)
+    p.add_argument("--n-states", type=int, default=1000,
+                   help="test states (a multiple of the window)")
     p.add_argument("--retrain", action="store_true")
     p.add_argument("--runs-dir", type=str, default="results/runs")
     p.add_argument("--out", type=str, default="results/experiments")
     args = p.parse_args()
 
-    out_dir = Path(args.out) / args.name
+    out_dir = Path(args.out) / (args.name + ("_fixed_slack" if args.fixed_slack_voltage else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
     variants = parse_variants(args.variants)
 
@@ -100,12 +115,13 @@ def main() -> None:
             sys.executable, str(TRAIN_SCRIPT),
             "--episodes", str(args.episodes),
             "--window", str(args.window),
+            "--ramp-frac", str(args.ramp_frac),
             "--lr-schedule", args.lr_schedule,
             "--seed", str(seed),
             "--name", run_name,
             "--out", args.runs_dir,
             "--quiet",
-        ]
+        ] + (["--voltage-first"] if args.voltage_first else [])
         print(f"[train] {run_name} ...", flush=True)
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
@@ -114,14 +130,28 @@ def main() -> None:
         print("        " + res.stdout.strip().splitlines()[-1])
 
     # ---- shared test set and OPF reference --------------------------
-    agent, _ = load_agent(run_dirs[args.seeds[0]], "last")
+    agent, meta0 = load_agent(run_dirs[args.seeds[0]], "last")
+    window = meta0["args"]["window"]
+    ramp = agent.dhelm.ramp
     states = test_states(agent, args.n_states, TEST_SEED)
-    ref = load_or_compute(opf_cache_path(args.n_states, TEST_SEED, False),
-                          states, agent.uncertainty, agent.action_config)
+    fixed = args.fixed_slack_voltage
+    ref = load_or_compute(
+        opf_cache_path(args.n_states, TEST_SEED, fixed, ramp=ramp,
+                       episode_length=window),
+        states, agent.uncertainty, agent.action_config, fixed,
+        ramp=ramp, episode_length=window,
+    )
     check = check_opf_reference(agent, ref)
     print(f"[opf] {check['opf_converged']}/{args.n_states} converged; "
           f"OPF@critic cost mismatch {check['cost_mismatch_max']:.1e} $/h, "
-          f"violation {check['violation_max']:.1e}")
+          f"violation {check['violation_max']:.1e}; mean cost "
+          f"{np.nanmean(ref['cost']):.1f} $/h")
+    if ramp is not None and "opf_ramp_bind_unit_share" not in check:
+        from dhelm_opf.utils.evaluation import ramp_binding
+        if ref["converged"].all():
+            b = ramp_binding(agent, ref["p_g"], ref["p_g_s"], window)
+            print(f"[opf] ramp limits bind: {b['ramp_bind_unit_share']:.1%} of "
+                  f"unit-steps, {b['ramp_bind_step_share']:.1%} of steps (t > 0)")
 
     # ---- evaluate ---------------------------------------------------
     rows = []
@@ -139,6 +169,8 @@ def main() -> None:
             res = evaluate_policy(agent, states, meta["args"]["window"],
                                   ref, refine)
             s = res["summary"]
+            s = {k: (";".join(f"{x:.4f}" for x in v) if isinstance(v, list) else v)
+                 for k, v in s.items()}
             rows.append({
                 "seed": seed,
                 "variant": variant_label(ckpt, mode, k),
@@ -167,10 +199,14 @@ def main() -> None:
         g, gs = ms("gap_mean")
         fe, fs = ms("feasible")
         t, _ = ms("ms_total_per_state")
-        summary.append({"variant": lab, "seeds": len(sel),
-                        "gap_mean": g, "gap_std": gs,
-                        "feasible_mean": fe, "feasible_std": fs,
-                        "ms_per_state": t})
+        row = {"variant": lab, "seeds": len(sel),
+               "gap_mean": g, "gap_std": gs,
+               "feasible_mean": fe, "feasible_std": fs,
+               "ms_per_state": t}
+        if "ramp_bind_step_share" in sel[0]:
+            row["ramp_bind_step_share"], _ = ms("ramp_bind_step_share")
+            row["ramp_bind_unit_share"], _ = ms("ramp_bind_unit_share")
+        summary.append(row)
 
     with open(out_dir / "summary.csv", "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(summary[0].keys()))
@@ -178,12 +214,16 @@ def main() -> None:
         w.writerows(summary)
 
     print(f"\n{args.name}: {len(args.seeds)} seeds, {args.episodes} episodes "
-          f"({args.episodes * 25} steps), lr schedule {args.lr_schedule}")
+          f"({args.episodes * 25} steps), window {window}, ramp "
+          f"{args.ramp_frac or 'off'}, OPF slack voltage "
+          f"{'fixed' if fixed else 'free'}, lr schedule {args.lr_schedule}")
     print(f"{'variant':20s} {'gap (mean ± std)':>20s} {'feasible':>16s} {'ms/state':>9s}")
     for s in summary:
         print(f"{s['variant']:20s} {100 * s['gap_mean']:+8.2f}% ± {100 * s['gap_std']:5.2f}"
               f"   {100 * s['feasible_mean']:6.1f}% ± {100 * s['feasible_std']:4.1f}"
-              f" {s['ms_per_state']:9.2f}")
+              f" {s['ms_per_state']:9.2f}"
+              + (f"   ramp binds {100 * s['ramp_bind_step_share']:5.1f}% of steps"
+                 if "ramp_bind_step_share" in s else ""))
 
     plot(rows, labels, out_dir / "summary.png", args.name)
     print(f"\nSaved to {out_dir}/")

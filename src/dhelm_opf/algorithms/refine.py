@@ -76,6 +76,8 @@ class RefineResult:
     refined: torch.Tensor       # (S,) bool, state was optimized at all
     steps_taken: torch.Tensor   # (S,) gradient steps applied per state
     seconds: float
+    p_g: torch.Tensor | None = None     # (S, n_g) MW at the refined action
+    p_g_s: torch.Tensor | None = None   # (S,) MW
 
 
 def refine_actions(
@@ -84,15 +86,18 @@ def refine_actions(
     s: torch.Tensor,
     a_hat: torch.Tensor,
     config: RefineConfig,
+    p_g_prev: torch.Tensor | None = None,
+    p_g_s_prev: torch.Tensor | None = None,
 ) -> RefineResult:
-    """Refine (S, a) actions a_hat for (S, d) states s.  See module docstring."""
+    """
+    Refine (S, a) actions a_hat for (S, d) states s.  See module docstring.
 
-    ccfg = critic.config
-    if ccfg.R_u is not None or ccfg.R_d is not None:
-        raise NotImplementedError(
-            "Refinement with ramping needs the previous step's slack "
-            "output; not implemented."
-        )
+    With ramping, p_g_prev (S, n_g) and p_g_s_prev (S,) are the previous
+    step's outputs in MW, held fixed during refinement: the refined p_g
+    stays inside its Eq. (3) window (via the Eq. 18 scaling) and the
+    slack ramp (16b) is part of z.  A whole episode is refined by
+    calling this once per time step (utils/evaluation.py).
+    """
 
     start = time.perf_counter()
 
@@ -119,7 +124,7 @@ def refine_actions(
     for k in range(config.K + 1):
 
         a_k = torch.tanh(logit)
-        out = critic(s, a_k)
+        out = critic(s, a_k, p_g_prev=p_g_prev, p_g_s_prev=p_g_s_prev)
 
         with torch.no_grad():
             cost = out.f_sum.detach()
@@ -165,7 +170,7 @@ def refine_actions(
         steps_taken += active.long()
 
     with torch.no_grad():
-        final = critic(s, best_a)
+        final = critic(s, best_a, p_g_prev=p_g_prev, p_g_s_prev=p_g_s_prev)
 
     viol = final.z.sum(dim=1)
 
@@ -177,4 +182,6 @@ def refine_actions(
         refined=refined,
         steps_taken=steps_taken,
         seconds=time.perf_counter() - start,
+        p_g=final.p_g.detach(),
+        p_g_s=final.p_g_s.detach(),
     )

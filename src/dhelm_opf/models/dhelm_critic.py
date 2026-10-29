@@ -40,8 +40,10 @@ Reproduction choices (see REPRODUCTION_STATUS.md)
   (16d)-(16e) are -i_max .. i_max, so eta = 1 / (2 i_max).
 * w_r = 1 / f_max, our reading of Table 1's "w_r = cost1max", with
   f_max = sum over all units (slack included) of f_g(P_max).
-* Ramping (16b) is supported for the slack unit (R_u, R_d in MW per
-  step, off when None).
+* Ramping: R_u, R_d come from the D-HELM's RampConfig (Eq. 3 rates are
+  not given in the paper).  The slack ramp enters z through (16b); the
+  non-slack units are kept inside their ramp window by the Eq. (18)
+  scaling in the D-HELM.
 * Lines whose max_i_ka is pandapower's "unlimited" placeholder
   (MATPOWER rateA = 0 -> 99999 kA) carry no current constraint.
 """
@@ -64,11 +66,6 @@ class CriticConfig:
 
     # Eq. (5), Table 1: w_0 = 2.
     w_0: float = 2.0
-
-    # Eq. (16b) ramp limits R_u, R_d of the slack unit, MW per step.
-    # None = no ramp constraint (only P_min / P_max).
-    R_u: float | None = None
-    R_d: float | None = None
 
     # max_i_ka at or above this value is treated as "no limit".
     unlimited_current_ka: float = 1e4
@@ -273,19 +270,26 @@ class DHELMCritic(torch.nn.Module):
             mag(self.Y_t_re, self.Y_t_im, self.I_base_t),
         )
 
+    @property
+    def ramping(self) -> bool:
+        return self.dhelm.ramp is not None
+
     def forward(
         self,
         s: torch.Tensor,
         a_hat: torch.Tensor,
+        p_g_prev: torch.Tensor | None = None,
         p_g_s_prev: torch.Tensor | None = None,
         N: int | None = None,
     ) -> CriticOutput:
         """
         Evaluate the critic.
 
+        p_g_prev:
+            (B, n_g) previous-step p_g of G_ns, MW (Eq. 3 via Eq. 18).
         p_g_s_prev:
-            (B,) slack output of the previous step, p*_g in (16b), MW.
-            Only used when ramp limits are configured.
+            (B,) previous-step slack output p*_g of (16b), MW.
+        Both are only used when the D-HELM has a RampConfig.
         N:
             Passed to the D-HELM (fixed number of terms; for tests).
         """
@@ -294,7 +298,11 @@ class DHELMCritic(torch.nn.Module):
         base = self.dhelm.base_mva
         B_s = self.dhelm.B_s
 
-        out = self.dhelm(s, a_hat, N=N)
+        p_g_prev_pu = None
+        if self.ramping and p_g_prev is not None:
+            p_g_prev_pu = torch.as_tensor(p_g_prev, dtype=DTYPE) / base
+
+        out = self.dhelm(s, a_hat, N=N, p_g_prev=p_g_prev_pu)
         specs = out.specs
 
         # ---- (15) slack p_g: injection minus everything else on the bus
@@ -325,13 +333,11 @@ class DHELMCritic(torch.nn.Module):
         P_lo = torch.full_like(p_g_s, self.P_min_s)
         P_hi = torch.full_like(p_g_s, self.P_max_s)
 
-        if p_g_s_prev is not None:
+        if self.ramping and p_g_s_prev is not None:
             prev = torch.as_tensor(p_g_s_prev, dtype=DTYPE,
                                    device=p_g_s.device).reshape(-1)
-            if cfg.R_d is not None:
-                P_lo = torch.maximum(P_lo, prev - cfg.R_d)
-            if cfg.R_u is not None:
-                P_hi = torch.minimum(P_hi, prev + cfg.R_u)
+            P_lo = torch.maximum(P_lo, prev - self.dhelm.R_d_s)
+            P_hi = torch.minimum(P_hi, prev + self.dhelm.R_u_s)
 
         eta_p = 1.0 / (self.P_max_s - self.P_min_s)
 

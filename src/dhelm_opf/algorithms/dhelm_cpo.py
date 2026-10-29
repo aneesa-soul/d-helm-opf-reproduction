@@ -63,6 +63,8 @@ class Evaluation:
     z: torch.Tensor           # (B * L, n_constraint)  Eq. (6)
     converged: torch.Tensor   # (B * L,) bool, D-HELM converged
     N: int                    # D-HELM series terms used
+    p_g: torch.Tensor | None = None     # (B * L, n_g) MW
+    p_g_s: torch.Tensor | None = None   # (B * L,) MW
 
 
 class DHelmCPO:
@@ -99,53 +101,88 @@ class DHelmCPO:
         if s.dim() == 2:
             s = s.unsqueeze(1)
 
+        if self.critic.ramping:
+            return self._rollout_with_ramping(s)
+
         a_hat = self.policy(s)                        # (B, L, a)
         B, L, _ = a_hat.shape
 
-        ccfg = self.critic.config
-        ramping = ccfg.R_u is not None or ccfg.R_d is not None
+        # Steps are independent for the critic: evaluate in one batch.
+        out = self.critic(
+            s.reshape(B * L, -1).to(torch.float64),
+            a_hat.reshape(B * L, -1).to(torch.float64),
+        )
+        return Evaluation(
+            a_hat=a_hat,
+            r=out.r,
+            f_sum=out.f_sum,
+            z=out.z,
+            converged=out.helm.converged,
+            N=out.helm.N,
+            p_g=out.p_g,
+            p_g_s=out.p_g_s,
+        )
 
-        if not ramping:
-            # Steps are independent for the critic: evaluate in one batch.
-            out = self.critic(
-                s.reshape(B * L, -1).to(torch.float64),
-                a_hat.reshape(B * L, -1).to(torch.float64),
-            )
-            return Evaluation(
-                a_hat=a_hat,
-                r=out.r,
-                f_sum=out.f_sum,
-                z=out.z,
-                converged=out.helm.converged,
-                N=out.helm.N,
-            )
+    def _rollout_with_ramping(self, s: torch.Tensor) -> Evaluation:
+        """
+        Step-by-step rollout over each window (Sec. 3.1, Eq. 3):
 
-        # With ramping, (16b) at step t needs the slack output of t-1.
-        r, f_sum, z, conv = [], [], [], []
-        p_g_s_prev = None
+            a_hat_t = pi(s_t, p_{g,t-1}),
+            p_{g,t} in [max(P_min, p_{g,t-1} - R_d), min(P_max, p_{g,t-1} + R_u)]
+            slack (16b) uses p*_g = p_{g_s,t-1}
+
+        The policy's extra input is the previous p_g of G_ns scaled by
+        the static range [P_min, P_max] to [-1, 1] (0 at t = 0, when
+        there is no previous step and no ramp limit).  Gradients flow
+        through p_{g,t-1}, so z_t depends on a_t and a_{t-1} as in the
+        paper.
+        """
+
+        policy = self.policy
+        acfg = self.critic.dhelm.action_config
+        B, L, _ = s.shape
+
+        s = s.to(policy.state_low.dtype)
+        P_min = torch.as_tensor(acfg.P_min, dtype=torch.float64)
+        P_max = torch.as_tensor(acfg.P_max, dtype=torch.float64)
+
+        hc = None
+        prev_in = s.new_zeros(B, policy.n_g)
+        p_g_prev, p_g_s_prev = None, None
+
+        a_hat, r, f_sum, z, conv, p_g, p_g_s = [], [], [], [], [], [], []
         N = 0
 
         for t in range(L):
+            a_hat_t, hc = policy.step(s[:, t], prev_in, hc)
             out = self.critic(
                 s[:, t].to(torch.float64),
-                a_hat[:, t].to(torch.float64),
+                a_hat_t.to(torch.float64),
+                p_g_prev=p_g_prev,
                 p_g_s_prev=p_g_s_prev,
             )
+            a_hat.append(a_hat_t)
             r.append(out.r)
             f_sum.append(out.f_sum)
             z.append(out.z)
             conv.append(out.helm.converged)
-            p_g_s_prev = out.p_g_s
+            p_g.append(out.p_g)
+            p_g_s.append(out.p_g_s)
             N = max(N, out.helm.N)
 
-        # Order (b, t) to match the reshape used above.
+            p_g_prev, p_g_s_prev = out.p_g, out.p_g_s
+            prev_in = (2.0 * (out.p_g - P_min) / (P_max - P_min) - 1.0).to(s.dtype)
+
+        # Order (b, t), matching the reshape of the non-ramping path.
         return Evaluation(
-            a_hat=a_hat,
+            a_hat=torch.stack(a_hat, dim=1),
             r=torch.stack(r, dim=1).reshape(-1),
             f_sum=torch.stack(f_sum, dim=1).reshape(-1),
             z=torch.stack(z, dim=1).reshape(B * L, -1),
             converged=torch.stack(conv, dim=1).reshape(-1),
             N=N,
+            p_g=torch.stack(p_g, dim=1).reshape(B * L, -1),
+            p_g_s=torch.stack(p_g_s, dim=1).reshape(-1),
         )
 
     def loss(self, ev: Evaluation) -> torch.Tensor:

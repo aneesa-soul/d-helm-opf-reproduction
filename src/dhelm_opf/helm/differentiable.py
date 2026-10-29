@@ -57,7 +57,7 @@ from dhelm_opf.environment.uncertainty import (
 from dhelm_opf.helm.problem import build_helm_problem_from_network
 from dhelm_opf.helm.recursion import build_A
 from dhelm_opf.helm.solver import HelmSolverConfig
-from dhelm_opf.models.action_config import ActionConfig
+from dhelm_opf.models.action_config import ActionConfig, RampConfig
 
 
 DTYPE = torch.float64
@@ -126,6 +126,11 @@ class DHelmNetwork(torch.nn.Module):
         Wind buses B_w / ratings and the state layout.
     solver_config:
         n_max, epsilon and n_min.  Defaults follow Algorithm 1.
+    ramp:
+        Ramp limits (Eq. 3).  When given, the p_g actions of step t are
+        scaled into the window [max(P_min, p_{g,t-1} - R_d),
+        min(P_max, p_{g,t-1} + R_u)] (Eq. 18 with time-varying a_min,
+        a_max) whenever the previous output p_g_prev is passed.
     """
 
     def __init__(
@@ -135,6 +140,7 @@ class DHelmNetwork(torch.nn.Module):
         uncertainty_config: UncertaintyConfig | None = None,
         solver_config: HelmSolverConfig | None = None,
         device: torch.device | str = "cpu",
+        ramp: RampConfig | None = None,
     ) -> None:
 
         super().__init__()
@@ -142,6 +148,7 @@ class DHelmNetwork(torch.nn.Module):
         self.action_config = action_config
         self.uncertainty_config = uncertainty_config or UncertaintyConfig()
         self.solver_config = solver_config or HelmSolverConfig()
+        self.ramp = ramp
 
         net = copy.deepcopy(net)
 
@@ -206,12 +213,39 @@ class DHelmNetwork(torch.nn.Module):
         self.n_v = cfg.n_v
         self.n_g = cfg.n_g
 
+        a_min = np.zeros(cfg.action_dim)
+        a_max = np.zeros(cfg.action_dim)
+        a_min[list(cfg.voltage_action_indices)] = cfg.v_min
+        a_max[list(cfg.voltage_action_indices)] = cfg.v_max
+        a_min[list(cfg.generator_action_indices)] = cfg.P_min / base
+        a_max[list(cfg.generator_action_indices)] = cfg.P_max / base
+
+        self.register_buffer("a_min", t(a_min))
+        self.register_buffer("a_max", t(a_max))
+
         self.register_buffer(
-            "a_min", t(np.concatenate([cfg.v_min, cfg.P_min / base]))
+            "idx_v", torch.as_tensor(cfg.voltage_action_indices,
+                                     dtype=torch.long, device=device)
         )
         self.register_buffer(
-            "a_max", t(np.concatenate([cfg.v_max, cfg.P_max / base]))
+            "idx_p", torch.as_tensor(cfg.generator_action_indices,
+                                     dtype=torch.long, device=device)
         )
+
+        # Static P limits of G_ns and ramp limits (Eq. 3), p.u.
+        self.register_buffer("P_min_g", t(cfg.P_min / base))
+        self.register_buffer("P_max_g", t(cfg.P_max / base))
+
+        if ramp is not None:
+            self.register_buffer(
+                "R_u_g", t([ramp.R_u(u) / base for u in cfg.G_ns])
+            )
+            self.register_buffer(
+                "R_d_g", t([ramp.R_d(u) / base for u in cfg.G_ns])
+            )
+            # Slack ramp limits in MW, used by the critic (Eq. 16b).
+            self.R_u_s = ramp.R_u(cfg.G_s)
+            self.R_d_s = ramp.R_d(cfg.G_s)
 
         # Voltage actions -> buses.
         C_v = np.zeros((cfg.n_v, n_bus))
@@ -305,12 +339,16 @@ class DHelmNetwork(torch.nn.Module):
         self,
         s: torch.Tensor,
         a_hat: torch.Tensor,
+        p_g_prev: torch.Tensor | None = None,
     ) -> DHelmSpecs:
         """
         Map (s, a_hat) to the specified injections and voltage
         setpoints, in p.u.
 
         Eq. (18):  a = a_min + (a_max - a_min) (a_hat + 1) / 2
+        Eq. (3):   with ramping and p_g_prev (p.u., (B, n_g)) given, the
+                   p_g bounds are max(P_min, p_g_prev - R_d) and
+                   min(P_max, p_g_prev + R_u)
         Eq. (8):   p_i = sum_{g in G_i} p_g + p_i^w - p_i^d,  q_i = -q_i^d
         """
 
@@ -337,8 +375,15 @@ class DHelmNetwork(torch.nn.Module):
         # Eq. (18)
         a = self.a_min + 0.5 * (a_hat + 1.0) * (self.a_max - self.a_min)
 
-        v_set = a[:, :n_v]
-        p_g = a[:, n_v:]
+        v_set = a[:, self.idx_v]
+        p_g = a[:, self.idx_p]
+
+        # Eq. (3): ramp window around the previous output.
+        if self.ramp is not None and p_g_prev is not None:
+            p_g_prev = p_g_prev.to(DTYPE)
+            lo = torch.maximum(self.P_min_g, p_g_prev - self.R_d_g)
+            hi = torch.minimum(self.P_max_g, p_g_prev + self.R_u_g)
+            p_g = lo + 0.5 * (a_hat[:, self.idx_p] + 1.0) * (hi - lo)
 
         p = (
             p_g @ self.C_g
@@ -406,6 +451,7 @@ class DHelmNetwork(torch.nn.Module):
         s: torch.Tensor,
         a_hat: torch.Tensor,
         N: int | None = None,
+        p_g_prev: torch.Tensor | None = None,
     ) -> DHelmOutput:
         """
         Evaluate D-HELM for a batch.
@@ -418,6 +464,8 @@ class DHelmNetwork(torch.nn.Module):
             If given, compute exactly N terms (no early stop).  Used for
             exact comparison with the NumPy solver and for gradcheck.
             If None, stop per Algorithm 1 / Eq. (14).
+        p_g_prev:
+            (B, n_g) previous-step p_g of G_ns in p.u. (ramping only).
         """
 
         if s.dim() == 1:
@@ -425,7 +473,7 @@ class DHelmNetwork(torch.nn.Module):
         if a_hat.dim() == 1:
             a_hat = a_hat.unsqueeze(0)
 
-        specs = self.specs(s, a_hat)
+        specs = self.specs(s, a_hat, p_g_prev)
 
         batch = s.shape[0]
         n_bus = self.n_bus

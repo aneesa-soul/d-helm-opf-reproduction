@@ -24,9 +24,18 @@ Outputs (in results/runs/<name>/):
     summary.json     last vs best step, cost, feasibility
     training.png     learning curves (best step marked)
 
+Defaults = the paper protocol (Table 1 and Sec. 3.1):
+    20 episodes x 25 steps = 500 updates, lr 1e-3 constant, batch 32,
+    lambda_0 = 10, the LSTM run over the whole 25-step episode, and
+    Eq. (3) ramping with R_u = R_d = 30% of P_max per step (the paper
+    gives no number; 30% is our choice, see REPRODUCTION_STATUS.md).
+
 Examples:
-    python scripts/train_dhelm_case5.py --window 1 --name case5_L1
-    python scripts/train_dhelm_case5.py --episodes 100 --lr-schedule cosine
+    # paper protocol
+    python scripts/train_dhelm_case5.py --seed 0 --name paper_s0
+    # the earlier extended runs (no ramping, single-step windows)
+    python scripts/train_dhelm_case5.py --window 1 --ramp-frac 0 \
+        --episodes 200 --voltage-first --name paper_5000_s0
 """
 
 from __future__ import annotations
@@ -45,6 +54,7 @@ import torch
 from dhelm_opf.algorithms.case5_setup import make_case5_agent
 from dhelm_opf.algorithms.dhelm_cpo import CPOConfig
 from dhelm_opf.environment.state_sampler import StateBuffer, StateSampler
+from dhelm_opf.utils.evaluation import ramp_from_args
 
 
 def parse_args(argv=None):
@@ -52,14 +62,24 @@ def parse_args(argv=None):
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--episodes", type=int, default=20)
     p.add_argument("--episode-length", type=int, default=25)
-    p.add_argument("--window", type=int, default=1)
+    p.add_argument("--window", type=int, default=25,
+                   help="steps the LSTM runs over per sample (25 = the "
+                        "whole episode, paper protocol)")
+    p.add_argument("--ramp-frac", type=float, default=0.3,
+                   help="R_u = R_d = frac * P_max per step, Eq. (3); "
+                        "0 disables ramping")
+    p.add_argument("--voltage-first", action="store_true",
+                   help="old action layout (|v| before p_g); default is "
+                        "Eq. (4): p_g first")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--eta-lam", type=float, default=1.0,
                    help="eta_lam, Eq. (20)")
     p.add_argument("--lam-max", type=float, default=1000.0,
                    help="lam_max, Eq. (20)")
-    p.add_argument("--eval-size", type=int, default=256)
+    p.add_argument("--eval-size", type=int, default=None,
+                   help="validation windows (default 64 for window 25, "
+                        "256 for window 1)")
     p.add_argument("--eval-every", type=int, default=5)
     p.add_argument("--lr-schedule", choices=("constant", "cosine"),
                    default="constant",
@@ -80,6 +100,12 @@ def parse_args(argv=None):
 def main(argv=None) -> Path:
 
     args = parse_args(argv)
+    if args.eval_size is None:
+        args.eval_size = 256 if args.window == 1 else 64
+    args.p_first = not args.voltage_first
+    if args.ramp_frac and args.window < 2:
+        print("note: ramping with window 1 has no previous step inside a "
+              "window, so the ramp limit never applies.")
     name = args.name or f"case5_L{args.window}_seed{args.seed}"
     out_dir = Path(args.out) / name
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -92,7 +118,10 @@ def main(argv=None) -> Path:
         lam_max=args.lam_max,
     )
 
-    agent = make_case5_agent(seed=args.seed, cpo_config=cpo_config)
+    agent = make_case5_agent(
+        seed=args.seed, cpo_config=cpo_config, p_first=args.p_first,
+        ramp=ramp_from_args(vars(args)),
+    )
     cpo, sampler = agent.cpo, agent.sampler
 
     total_steps = args.episodes * args.episode_length

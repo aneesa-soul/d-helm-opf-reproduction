@@ -19,7 +19,11 @@ from dhelm_opf.environment.state_sampler import StateSampler
 from dhelm_opf.environment.uncertainty import UncertaintyConfig
 from dhelm_opf.helm.differentiable import DHelmNetwork
 from dhelm_opf.helm.solver import HelmSolverConfig
-from dhelm_opf.models.action_config import ActionConfig, action_config_from_network
+from dhelm_opf.models.action_config import (
+    ActionConfig,
+    RampConfig,
+    action_config_from_network,
+)
 from dhelm_opf.models.dhelm_critic import CriticConfig, DHELMCritic
 from dhelm_opf.models.policy import DHelmPolicy
 
@@ -42,15 +46,23 @@ def make_case5_agent(
     critic_config: CriticConfig | None = None,
     solver_config: HelmSolverConfig | None = None,
     hidden: int = 64,
+    p_first: bool = True,
+    ramp: RampConfig | None = None,
 ) -> Case5Agent:
+    """
+    p_first: action order of Eq. (4) (p_g first).  False reproduces the
+             voltage-first layout of runs made before that change.
+    ramp:    Eq. (3) ramp limits; None disables ramping.
+    """
 
     torch.manual_seed(seed)
 
     net = build_case5()
-    action_config = action_config_from_network(net)
+    action_config = action_config_from_network(net, p_first=p_first)
     uncertainty = UncertaintyConfig()
 
-    dhelm = DHelmNetwork(net, action_config, uncertainty, solver_config)
+    dhelm = DHelmNetwork(net, action_config, uncertainty, solver_config,
+                         ramp=ramp)
     critic = DHELMCritic(dhelm, net, critic_config)
 
     sampler = StateSampler(dhelm.n_d, dhelm.n_w, uncertainty, seed=seed)
@@ -62,6 +74,7 @@ def make_case5_agent(
         state_low=sampler.low,
         state_high=sampler.high,
         hidden=hidden,
+        idx_p=action_config.generator_action_indices,
     )
 
     cpo = DHelmCPO(policy, critic, cpo_config)
