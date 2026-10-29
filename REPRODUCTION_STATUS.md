@@ -238,6 +238,8 @@ Validation (`scripts/test_policy_training.py`):
 
 **Status: Complete. Results are reported over 5 seeds against a cached, matched OPF reference.**
 
+> **These runs are extensions, not the paper protocol:** 2,500–5,000 steps, window 1, no ramping, voltage-first action layout. The paper-protocol results are in Section 10.
+
 Components:
 
 * **Best checkpoint** (`scripts/train_dhelm_case5.py`). Among the validation evaluations (256 states, seed 10000 + seed, never trained on), it is the one with the lowest validation cost that has ≥ 99% feasible states. If none qualifies, the lowest validation loss is used instead. The output files are `policy_best.pt` and `summary.json`.
@@ -289,10 +291,75 @@ Findings:
 * **Why R2 stalls.** In many states the optimum lies on the action bounds (gen2 at 600 MW, other units at 0, voltages at 1.1 p.u.) and on the slack's 0 MW lower limit. The remaining improving direction runs *along* that limit, shifting power between units at roughly 5 $/MWh saving, while the penalty kink is about 60× steeper. Penalty-gradient steps therefore zig-zag across the boundary and progress slowly.
 * **Things that did not help R2:** larger λ, projected gradient steps in action space, and a decaying step size.
 
-### 10. Remaining work
+### 10. Paper protocol: 500 steps, full-episode LSTM, ramping
+
+**Status: Run over 5 seeds. These are the reproduction results; Section 9's numbers are extended-training runs, not the paper's settings.**
+
+Settings, all from the paper unless marked:
+
+* 20 episodes × 25 steps = 500 updates, Adam lr 1e-3 constant, minibatch 32, λ⁽⁰⁾ = 10 (Table 1).
+* The LSTM runs over the whole 25-step episode (window 25), step by step, with the previous p_g of G_ns as its extra input.
+* Eq. (4) action order: p_g first, then |v|.
+* Ramping (Eq. 3) on for every unit, slack included. **Our choice: R_u = R_d = 30% of P_max per step**, because the paper names ramp limits but gives no rates. Non-slack units are limited through the Eq. (18) window, the slack through 16b. There is no ramp at t = 0.
+* Primary result: the last (trained) checkpoint. The best checkpoint is shown for reference only.
+* Test set: 1,000 held-out states (40 episodes, seed 20000).
+
+**OPF reference with ramping** (`utils/opf_reference.py`). Each test episode is solved as a sequence of OPFs. At t > 0 every unit's limits become the Eq. (3) window around the OPF's own previous dispatch. Results are cached per ramp fraction, episode length and slack-voltage mode. Two versions are reported:
+
+* **Slack voltage free** (the paper's problem, since B_s is an action): 993/1,000 converged, mean 9,058 $/h.
+* **Slack voltage fixed** at its setpoint (pandapower's default): 986/1,000 converged, mean 10,032 $/h.
+
+The non-converged steps are cases where the ramp window cannot reach the net demand (checked at tighter ramps: reachable generation is below load minus wind). Passed through the ramp-aware critic, the OPF solutions reproduce their cost to 0.02 $/h, with Σz ≤ 1.1×10⁻⁶.
+
+Results, 5 seeds, mean ± std over seeds:
+
+| Variant | Gap vs OPF (slack V free) | Gap vs OPF (slack V fixed) | Feasible | ms/state |
+|---|---|---|---|---|
+| trained policy (last) | +40.7% ± 28.8 | +27.1% ± 26.2 | 91.9% ± 2.5 | 0.2 |
+| + R1, K = 20 (paper, Remark 5) | +41.1% ± 28.8 | +27.4% ± 26.2 | 99.3% ± 0.4 | 5 |
+| + R2, K = 5 | +32.3% ± 29.0 | +19.4% ± 26.3 | 93.8% ± 3.4 | 3 |
+| + R2, K = 20 | +29.7% ± 29.4 | +17.0% ± 26.7 | 93.9% ± 3.5 | 11 |
+| + R2, K = 50 | +29.5% ± 29.4 | +16.9% ± 26.8 | 97.5% ± 1.5 | 29 |
+| + R2, K = 200 | +25.5% ± 27.8 | +13.3% ± 25.3 | 99.5% ± 0.3 | 123 |
+| best checkpoint (reference) | +44.0% ± 26.6 | +30.0% ± 24.2 | 93.9% ± 3.0 | 0.2 |
+
+Per seed (slack V free), trained policy → + R2 K = 200: seed 0 +28.3 → +13.3%, seed 1 +33.7 → +15.6%, seed 2 +90.3 → +74.3%, seed 3 +15.3 → +4.6%, seed 4 +36.1 → +19.7%.
+
+Ramp binding (steps t > 0 with at least one unit within 1 MW of a ramp edge tighter than its static limit):
+
+* OPF reference: 55% of steps (slack V free), 32% (fixed). It binds mostly on the two small cheap units at bus 0, gen0 (12 MW/step) and sgen0 (51 MW/step).
+* Trained policy: 3.5% of steps.
+
+Findings:
+
+* **The paper's near-optimality within 500 steps is not reproduced.** Under the paper's own protocol the trained policy is +41% above the matched OPF, against +3.5% after 5,000 steps without ramping (Section 9).
+* **Seed variance is very large** (std 29 points). Seed 2 stalls at +90%; seed 3 reaches +15%.
+* **R1 reproduces Remark 5**: feasibility rises from 92% to 99.3% at essentially unchanged cost.
+* **R2 helps but cannot rescue an under-trained policy**: −15 points at K = 200, at about 120 ms per state.
+* **The policy rarely uses the ramp limits the OPF uses** (3.5% against 55% of steps). Cheap units are not pushed to their ramp edges, which accounts for part of the gap.
+* The fixed-slack-voltage OPF is a weaker optimum (+11% cost), so gaps against it look smaller. It is shown for comparison only; the slack-voltage-free OPF is the paper's problem.
+
+Reproducing the earlier runs: `--window 1 --ramp-frac 0 --voltage-first --episodes 200` (see the docstrings of `scripts/train_dhelm_case5.py` and `scripts/run_seeds.py`).
+
+### Departures and choices (summary)
+
+Choices where the paper names something without a number, or is unreadable:
+
+* Ramp rate 30% of P_max per step (Eq. 3).
+* Episode length 25, from "20 episodes (≤ 500 steps)".
+* Policy input "+4" = the previous p_g of G_ns (Table 1 symbol unreadable).
+* η_n = 1/(x̄ − x̲), w_r = 1/f_max, η_λ = 1, λ_max = 1,000 (Section 7–8).
+* Wind buses 1 and 4 (Section 5).
+* Action order inside the p_g and |v| blocks: by bus, `gen` before `sgen`.
+
+Matching the OPF reference to the paper's problem (not a change to the method): unrated lines unconstrained, slack voltage free, sequential OPF with the same ramp windows.
+
+Extensions, reported separately from the reproduction: R2 refinement, longer training (2,500 / 5,000 steps), cosine LR, best-checkpoint selection, single-step windows without ramping.
+
+### 11. Remaining work
 
 * A constrained refinement using the critic's exact Jacobians (SQP or augmented Lagrangian) to remove R2's boundary crawl.
-* Training-side improvements toward the paper's 500-step claim, such as learning rate and network size. Since the optimum often lies at action bounds, the tanh parametrization (Eq. 18) is worth examining.
+* Training-side improvements toward the paper's 500-step claim (Section 10 shows the gap and the large seed variance), such as learning rate and network size. Since the optimum often lies at action bounds, the tanh parametrization (Eq. 18) is worth examining.
 * The physics-informed extensions planned for this project.
 * Baselines: SAC, PPO and DDPG (Tianshou, gymnasium environment) and MBPO.
 * The 30-, 118- and 300-bus systems.
@@ -340,7 +407,8 @@ The following are complete and validated:
 
 Results, over 5 seeds against the matched OPF:
 
-* **Reproduction:** with the paper's settings plus R1, after 5,000 steps, the gap is +3.5% at 100% feasibility. The paper's near-optimality within 500 steps is not reproduced.
-* **Improvement:** with R2 (K = 200) the gap is +1.8% ± 0.1 at 100% feasibility, at about 44 ms per state against 300–800 ms for the OPF.
+* **Reproduction (paper protocol, Section 10):** 500 steps, full-episode LSTM, ramping at 30% of P_max. The trained policy is +40.7% ± 28.8 above the matched OPF; + R1 it is 99.3% feasible at +41.1%. The paper's near-optimality within 500 steps is not reproduced.
+* **Improvement (R2, K = 200) under the paper protocol:** +25.5% ± 27.8 at 99.5% feasibility.
+* **Extended training (Section 9, not the paper's settings):** 5,000 steps without ramping, +3.5% (R1) and +1.8% ± 0.1 (R2, K = 200).
 
-Next targets are listed in Section 10.
+Next targets are listed in Section 11.
