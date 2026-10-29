@@ -9,7 +9,9 @@ description = "Independent reproduction of the D-HELM optimal power flow method"
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
-    "pandapower>=2.13",
+    # pandapower < 3 breaks its OPF with scipy >= 1.14 (csc_matrix.H was
+    # removed), so every runopp fails.  Results were produced with 3.5.6.
+    "pandapower>=3.0",
     "torch>=2.0",
     "matplotlib",
 ]
