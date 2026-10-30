@@ -10,8 +10,9 @@ For each held-out test state (seed 20000, never used in training):
     OPF@critic       the OPF solutions passed through the critic: their
                      cost must equal the OPF cost and z must be ~0
 
-Reported: feasibility (sum z <= 1e-6), optimality gap
-(policy - OPF) / OPF, and timing.
+Reported: feasibility (paper, Sec. 4.4: ||eta Z||_2 <= 1e-4; also the
+stricter sum z <= 1e-6), optimality gap (policy - OPF) / OPF, reward and
+cost per profile (Table 2), and timing.
 
 Examples:
     python scripts/evaluate_vs_opf.py results/runs/case5_L1_ep100
@@ -47,10 +48,10 @@ def main() -> None:
     p.add_argument("run_dir")
     p.add_argument("--checkpoint", choices=("best", "last"), default="best")
     p.add_argument("--refine", choices=("none", "r1", "r2"), default="none")
-    p.add_argument("--refine-K", type=int, default=20,
-                   help="refinement step budget K")
+    p.add_argument("--refine-K", type=int, default=3,
+                   help="refinement step budget K (paper: < 4)")
     p.add_argument("--refine-lr", type=float, default=0.03)
-    p.add_argument("--n-states", type=int, default=1000,
+    p.add_argument("--n-states", type=int, default=2400,
                    help="test states (a multiple of the window)")
     p.add_argument("--seed", type=int, default=TEST_SEED)
     p.add_argument("--fixed-slack-voltage", action="store_true",
@@ -97,7 +98,8 @@ def main() -> None:
     print(f"OPF@critic cost mismatch      : {check['cost_mismatch_max']:.2e} $/h (max)")
     print(f"OPF@critic total violation    : {check['violation_max']:.2e} (max)")
     print()
-    print(f"Feasible                      : {s['feasible']:.1%} (Σz <= 1e-6)")
+    print(f"Feasible                      : {s['feasible']:.1%} (||z|| <= 1e-4, paper)"
+          f"; {s['feasible_strict']:.1%} (Σz <= 1e-6)")
     print(f"Mean violation Σz             : {s['violation_mean']:.2e}")
     print(f"Mean cost   policy / OPF      : {s['cost_mean']:.1f} / "
           f"{s['opf_cost_mean']:.1f} $/h")
@@ -105,6 +107,11 @@ def main() -> None:
           f"median {pct(s['gap_median'])}, 95th pct {pct(s['gap_p95'])}, "
           f"max {pct(s['gap_max'])}")
     print(f"Optimality gap, feasible only : mean {pct(s['gap_feasible_mean'])}")
+    print(f"Per profile ({s['profile_length']} samples, Table 2): reward "
+          f"{s['reward_per_profile_mean']:.2f} ± {s['reward_per_profile_std']:.2f}, "
+          f"cost {s['cost_per_profile_mean']:.4g} $  |  OPF reward "
+          f"{s['opf_reward_per_profile_mean']:.2f}, cost "
+          f"{s['opf_cost_per_profile_mean']:.4g} $")
     if refine is not None:
         print(f"Refined states                : {s['refined_states']} "
               f"(mean {s['refine_steps_mean']:.1f} steps)")

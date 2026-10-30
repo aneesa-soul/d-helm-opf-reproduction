@@ -291,9 +291,9 @@ Findings:
 * **Why R2 stalls.** In many states the optimum lies on the action bounds (gen2 at 600 MW, other units at 0, voltages at 1.1 p.u.) and on the slack's 0 MW lower limit. The remaining improving direction runs *along* that limit, shifting power between units at roughly 5 $/MWh saving, while the penalty kink is about 60× steeper. Penalty-gradient steps therefore zig-zag across the boundary and progress slowly.
 * **Things that did not help R2:** larger λ, projected gradient steps in action space, and a decaying step size.
 
-### 10. Paper protocol: 500 steps, full-episode LSTM, ramping
+### 10. Paper protocol: 500 steps, full-episode LSTM, ramping (25-step episodes)
 
-**Status: Run over 5 seeds. These are the reproduction results; Section 9's numbers are extended-training runs, not the paper's settings.**
+**Status: Run over 5 seeds on two machines (means agree within 0.15 points). Superseded as the reference protocol by Section 11, which corrects the episode length, the Remark 5 settings and the evaluation after a closer reading of the paper's Section 4. Kept because it is a valid 500-step learning test.**
 
 Settings, all from the paper unless marked:
 
@@ -332,7 +332,7 @@ Ramp binding (steps t > 0 with at least one unit within 1 MW of a ramp edge tigh
 
 Findings:
 
-* **The paper's near-optimality within 500 steps is not reproduced.** Under the paper's own protocol the trained policy is +41% above the matched OPF, against +3.5% after 5,000 steps without ramping (Section 9).
+* **After 500 steps the trained policy is +41% above the matched OPF**, against +3.5% after 5,000 steps without ramping (Section 9). Note (Section 11): the paper does not report a 5-bus optimality gap at 500 steps; its "20 episodes" statement refers to the Fig. 5 learning curves.
 * **Seed variance is very large** (std 29 points). Seed 2 stalls at +90%; seed 3 reaches +15%.
 * **R1 reproduces Remark 5**: feasibility rises from 92% to 99.3% at essentially unchanged cost.
 * **R2 helps but cannot rescue an under-trained policy**: −15 points at K = 200, at about 120 ms per state.
@@ -346,7 +346,8 @@ Reproducing the earlier runs: `--window 1 --ramp-frac 0 --voltage-first --episod
 Choices where the paper names something without a number, or is unreadable:
 
 * Ramp rate 30% of P_max per step (Eq. 3).
-* Episode length 25, from "20 episodes (≤ 500 steps)".
+* Episode length 24 (Section 11), from the 24-sample profiles and "20 episodes (≤ 500 steps)"; Section 10 used 25.
+* The norm in the feasibility test ‖ηZ‖ ≤ 10⁻⁴ (Euclidean), and R1 acting on the actions (Remark 5) rather than the policy weights (Sec. 4.4).
 * Policy input "+4" = the previous p_g of G_ns (Table 1 symbol unreadable).
 * η_n = 1/(x̄ − x̲), w_r = 1/f_max, η_λ = 1, λ_max = 1,000 (Section 7–8).
 * Wind buses 1 and 4 (Section 5).
@@ -356,7 +357,44 @@ Matching the OPF reference to the paper's problem (not a change to the method): 
 
 Extensions, reported separately from the reproduction: R2 refinement, longer training (2,500 / 5,000 steps), cosine LR, best-checkpoint selection, single-step windows without ramping.
 
-### 11. Remaining work
+### 11. What the paper reports for the 5-bus system, and the corrected protocol
+
+A section-by-section reading of the paper's Section 4 (2026-10-30) shows what each 5-bus result is based on:
+
+| Paper result | What it is | Training | Evaluation |
+|---|---|---|---|
+| "takes only 20 episodes (≤ 500 steps) to converge" (Sec. 4.2) | Fig. 5: reward, cost and violation learning curves, 5 seeds | 20 episodes | the curves themselves |
+| Table 2 (5-bus: reward 42.4 ± 0.66, cost 3.74 × 10⁵ $) | deterministic evaluation of the trained agents | "1000 … episodes for the 5-bus" system | 100 random profiles × 24 samples = 2,400 samples |
+| Fig. 10 | policy vs a nonlinear solver, 144 points | – | 78.5% of solutions with zero violations (Q2 limit); solver fails on some points |
+| Table 3 (optimality gap vs PP solver) | **30-, 118- and 300-bus only** | – | 1,000 profiles × 24; feasible if ‖ηZ‖ ≤ 10⁻⁴; "Enhanced" = Remark 5 with < 4 gradient steps |
+
+So there is no reported 5-bus optimality gap to match. The comparable quantities are the Fig. 5 curves (after ~20 episodes) and Table 2 (after 1,000 episodes).
+
+Corrections to the protocol, all taken from the paper:
+
+* **Episode length 24** (was 25). The evaluation profiles have 24 samples, and 20 × 24 = 480 fits "≤ 500 steps". The LSTM runs over the whole 24-step episode.
+* **Remark 5 refinement (R1): K = 3** (Table 3: "< 4 gradient steps"; was 20).
+* **Feasibility test ‖ηZ‖ ≤ 10⁻⁴** (Sec. 4.4; z already includes η). It is used in R1 and in the reported feasibility. The stricter Σz ≤ 10⁻⁶ used before is still reported as `feasible_strict`.
+* **Evaluation as in Table 2:** 100 test profiles × 24 samples, with the reward (Eq. 5) and the cost summed per profile, next to the gap against the matched sequential OPF.
+* **Two training lengths:** 20 episodes (Fig. 5) and 1,000 episodes (Table 2 agents).
+
+Our choices within these, where the paper is silent or inconsistent:
+
+* **The norm in ‖ηZ‖** is not named; we use the Euclidean norm.
+* **What R1 changes.** Remark 5 says the control actions are adjusted "without modifying all policy parameters"; Sec. 4.4 says "the parameters of the learned policy are updated for only the operational point". We follow Remark 5 (actions). The R1 step size (Adam, 0.03 in pre-tanh space) is ours.
+* **Profiles are independent samples** of the uncertainty ranges. The paper's profile generator and its wind buses are in an electronic companion ([38]) that is not available online (the 2024 paper's companion link is dead; checked 2026-10-30).
+* **Reward-scale check.** Working back from Table 2 (reward per 24-sample profile and cost per profile) gives 1/w_r within a factor of 1.0–2.6 of our f_max on all four systems, across three orders of magnitude, so our reading of w_r is the right scale. An exact match is not possible from Table 2 alone (its reward may include the violation terms).
+
+Commands (defaults are this protocol):
+
+```
+python scripts/run_seeds.py --name paper_fig5
+python scripts/run_seeds.py --name paper_table2 --episodes 1000 --eval-every 50
+```
+
+Results: pending.
+
+### 12. Remaining work
 
 * A constrained refinement using the critic's exact Jacobians (SQP or augmented Lagrangian) to remove R2's boundary crawl.
 * Training-side improvements toward the paper's 500-step claim (Section 10 shows the gap and the large seed variance), such as learning rate and network size. Since the optimum often lies at action bounds, the tanh parametrization (Eq. 18) is worth examining.
@@ -411,4 +449,4 @@ Results, over 5 seeds against the matched OPF:
 * **Improvement (R2, K = 200) under the paper protocol:** +25.5% ± 27.8 at 99.5% feasibility.
 * **Extended training (Section 9, not the paper's settings):** 5,000 steps without ramping, +3.5% (R1) and +1.8% ± 0.1 (R2, K = 200).
 
-Next targets are listed in Section 11.
+Next targets are listed in Section 12.

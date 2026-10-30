@@ -25,14 +25,17 @@ Outputs (in results/runs/<name>/):
     training.png     learning curves (best step marked)
 
 Defaults = the paper protocol (Table 1 and Sec. 3.1):
-    20 episodes x 25 steps = 500 updates, lr 1e-3 constant, batch 32,
-    lambda_0 = 10, the LSTM run over the whole 25-step episode, and
+    20 episodes x 24 steps = 480 updates ("20 episodes (<= 500 steps)";
+    24 = the paper's profile length, Sec. 4.2), lr 1e-3 constant,
+    batch 32, lambda_0 = 10, the LSTM run over the whole episode, and
     Eq. (3) ramping with R_u = R_d = 30% of P_max per step (the paper
     gives no number; 30% is our choice, see REPRODUCTION_STATUS.md).
 
 Examples:
-    # paper protocol
+    # paper protocol, Fig. 5 (20 episodes)
     python scripts/train_dhelm_case5.py --seed 0 --name paper_s0
+    # paper protocol, Table 2 agents (1000 episodes for the 5-bus system)
+    python scripts/train_dhelm_case5.py --seed 0 --episodes 1000 --eval-every 50 --name t2_s0
     # the earlier extended runs (no ramping, single-step windows)
     python scripts/train_dhelm_case5.py --window 1 --ramp-frac 0 \
         --episodes 200 --voltage-first --name paper_5000_s0
@@ -61,10 +64,10 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--episodes", type=int, default=20)
-    p.add_argument("--episode-length", type=int, default=25)
-    p.add_argument("--window", type=int, default=25,
-                   help="steps the LSTM runs over per sample (25 = the "
-                        "whole episode, paper protocol)")
+    p.add_argument("--episode-length", type=int, default=24)
+    p.add_argument("--window", type=int, default=None,
+                   help="steps the LSTM runs over per sample (default: "
+                        "the whole episode, paper protocol)")
     p.add_argument("--ramp-frac", type=float, default=0.3,
                    help="R_u = R_d = frac * P_max per step, Eq. (3); "
                         "0 disables ramping")
@@ -100,6 +103,8 @@ def parse_args(argv=None):
 def main(argv=None) -> Path:
 
     args = parse_args(argv)
+    if args.window is None:
+        args.window = args.episode_length
     if args.eval_size is None:
         args.eval_size = 256 if args.window == 1 else 64
     args.p_first = not args.voltage_first

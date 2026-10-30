@@ -11,6 +11,8 @@ the test set has both feasible and infeasible states.
    then cost) and lowers the mean cost of feasible states.
 4. The OPF cache reproduces a fresh solve, and the OPF solutions are
    feasible for the critic with the same cost.
+5. Paper defaults (Table 3, Sec. 4.4): K = 3 and ||eta Z||_2 <= 1e-4;
+   R1 with them never makes a state worse.
 
 Run:
     python scripts/test_refinement.py
@@ -25,7 +27,7 @@ import numpy as np
 import torch
 
 from dhelm_opf.algorithms.case5_setup import make_case5_agent
-from dhelm_opf.algorithms.refine import RefineConfig, refine_actions
+from dhelm_opf.algorithms.refine import RefineConfig, refine_actions, violation_measure
 from dhelm_opf.utils.evaluation import check_opf_reference
 from dhelm_opf.utils.opf_reference import compute_reference, load_or_compute
 
@@ -56,7 +58,7 @@ def test_r1(agent, states, a0, out0) -> None:
     assert feas0.any() and (~feas0).any(), "test set needs both kinds"
 
     r = refine_actions(agent.critic, agent.cpo.lam, states, a0,
-                       RefineConfig(mode="r1", K=50))
+                       RefineConfig(mode="r1", K=50, feasible_norm="sum", feasible_tol=TOL))
     viol = r.z.sum(dim=1)
 
     assert torch.all(r.a_hat.abs() <= 1.0)
@@ -79,7 +81,7 @@ def test_r2(agent, states, a0, out0) -> None:
     feas0 = viol0 <= TOL
 
     r = refine_actions(agent.critic, agent.cpo.lam, states, a0,
-                       RefineConfig(mode="r2", K=50))
+                       RefineConfig(mode="r2", K=50, feasible_norm="sum", feasible_tol=TOL))
     viol = r.z.sum(dim=1)
 
     assert torch.all(r.a_hat.abs() <= 1.0)
@@ -125,6 +127,27 @@ def test_opf_cache(agent) -> None:
           f"{check['violation_max']:.1e}")
 
 
+def test_paper_defaults(agent, states, a0, out0) -> None:
+
+    cfg = RefineConfig()
+    assert (cfg.mode, cfg.K, cfg.feasible_tol, cfg.feasible_norm) == ("r1", 3, 1e-4, "l2")
+
+    z = torch.tensor([[3e-5, 4e-5, 0.0], [1e-4, 1e-4, 0.0]], dtype=torch.float64)
+    assert torch.allclose(violation_measure(z, "l2"), torch.tensor([5e-5, 2 ** 0.5 * 1e-4], dtype=torch.float64))
+    assert torch.allclose(violation_measure(z, "sum"), torch.tensor([7e-5, 2e-4], dtype=torch.float64))
+
+    m0 = violation_measure(out0.z.detach(), "l2")
+    r = refine_actions(agent.critic, agent.cpo.lam, states, a0, cfg)
+    m = violation_measure(r.z, "l2")
+    feas0 = m0 <= 1e-4
+    assert torch.equal(r.a_hat[feas0], a0[feas0])          # feasible: untouched
+    assert bool((m[~feas0] <= m0[~feas0] + 1e-12).all())    # never worse
+    assert int(r.steps_taken.max()) <= 3
+
+    print(f"  5. paper defaults (K=3, ||z||<=1e-4) : OK "
+          f"(feasible {feas0.double().mean():.0%} -> {(m <= 1e-4).double().mean():.0%})")
+
+
 def main() -> None:
 
     torch.manual_seed(0)
@@ -134,6 +157,7 @@ def main() -> None:
     test_r1(agent, states, a0, out0)
     test_r2(agent, states, a0, out0)
     test_opf_cache(agent)
+    test_paper_defaults(agent, states, a0, out0)
 
     print("All refinement tests passed.")
 

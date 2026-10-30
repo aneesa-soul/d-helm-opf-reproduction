@@ -15,11 +15,17 @@ import torch
 
 from dhelm_opf.algorithms.case5_setup import Case5Agent, make_case5_agent
 from dhelm_opf.algorithms.dhelm_cpo import CPOConfig
-from dhelm_opf.algorithms.refine import RefineConfig, refine_actions
+from dhelm_opf.algorithms.refine import RefineConfig, refine_actions, violation_measure
 from dhelm_opf.environment.state_sampler import StateSampler
 from dhelm_opf.models.action_config import RampConfig
 
-FEASIBLE_TOL = 1e-6
+# Feasibility test of the paper (Sec. 4.4): ||eta Z|| <= 1e-4, with the
+# Euclidean norm (our choice; the paper does not name the norm).  The
+# stricter test used before (sum z <= 1e-6) is reported as
+# "feasible_strict".
+FEASIBLE_TOL = 1e-4
+FEASIBLE_NORM = "l2"
+STRICT_TOL = 1e-6
 TEST_SEED = 20_000
 RAMP_BIND_TOL_MW = 1.0      # "at a ramp limit": within 1 MW of the edge
 
@@ -192,7 +198,9 @@ def evaluate_policy(
             steps_mean = float(r.steps_taken[r.refined].double().mean()) if n_refined else 0.0
 
     viol = z.sum(axis=1)
-    feas = viol <= FEASIBLE_TOL
+    measure = violation_measure(torch.as_tensor(z), FEASIBLE_NORM).numpy()
+    feas = measure <= FEASIBLE_TOL
+    feas_strict = viol <= STRICT_TOL
 
     opf = ref["cost"]
     ok = ref["converged"]
@@ -206,6 +214,7 @@ def evaluate_policy(
         "states": int(S),
         "opf_converged": int(ok.sum()),
         "feasible": float(feas.mean()),
+        "feasible_strict": float(feas_strict.mean()),
         "violation_mean": float(viol.mean()),
         "cost_mean": float(cost[ok].mean()),
         "opf_cost_mean": float(opf[ok].mean()),
@@ -221,6 +230,28 @@ def evaluate_policy(
         "ms_total_per_state": 1e3 * (t_policy + t_refine) / S,
     }
 
+    # Per profile (= episode of `window` consecutive states), as in the
+    # paper's Table 2: reward (Eq. 5) and cost summed over the profile.
+    # Profiles with a failed OPF step are left out of the OPF columns.
+    r = agent.critic.config.w_0 - agent.critic.w_r * cost
+    P = S // window
+    r_prof = r.reshape(P, window).sum(axis=1)
+    c_prof = cost.reshape(P, window).sum(axis=1)
+    ok_prof = ok.reshape(P, window).all(axis=1)
+    o_prof = opf.reshape(P, window).sum(axis=1)
+    r_opf = (agent.critic.config.w_0 - agent.critic.w_r * opf).reshape(P, window).sum(axis=1)
+    summary.update({
+        "profiles": int(P),
+        "profile_length": int(window),
+        "reward_per_profile_mean": float(r_prof.mean()),
+        "reward_per_profile_std": float(r_prof.std()),
+        "cost_per_profile_mean": float(c_prof.mean()),
+        "opf_profiles": int(ok_prof.sum()),
+        "opf_reward_per_profile_mean": stat(np.mean, r_opf[ok_prof]),
+        "opf_cost_per_profile_mean": stat(np.mean, o_prof[ok_prof]),
+        "cost_per_profile_mean_opf_profiles": stat(np.mean, c_prof[ok_prof]),
+    })
+
     if agent.critic.ramping:
         summary.update(ramp_binding(agent, roll["p_g"], roll["p_g_s"], window))
         if "p_g" in ref and ok.all():
@@ -229,6 +260,7 @@ def evaluate_policy(
 
     per_state = {
         "cost": cost, "opf_cost": opf, "gap": gap, "violation": viol,
+        "violation_norm": measure,
         "z": z, "a_hat": np.asarray(a_hat),
     }
 

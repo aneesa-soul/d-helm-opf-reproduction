@@ -53,18 +53,38 @@ from dhelm_opf.models.dhelm_critic import DHELMCritic
 DTYPE = torch.float64
 
 
+def violation_measure(z: torch.Tensor, norm: str = "l2") -> torch.Tensor:
+    """
+    Per-state degree of violation of the (S, n) violation vector z.
+
+    "l2"  : ||z||_2, the paper's test ||eta Z|| <= 1e-4 (Sec. 4.4; z
+            already includes eta, Eq. 6).  The paper does not name the
+            norm; the Euclidean norm is our choice.
+    "sum" : sum_n z_n, the stricter test used before (with tol 1e-6).
+    """
+
+    if norm == "l2":
+        return torch.linalg.vector_norm(z, dim=-1)
+    if norm == "sum":
+        return z.sum(dim=-1)
+    raise ValueError("norm must be 'l2' or 'sum'.")
+
+
 @dataclass(frozen=True)
 class RefineConfig:
     mode: str = "r1"            # "r1" (paper) or "r2" (extension)
-    K: int = 20                 # gradient-step budget
+    K: int = 3                  # gradient-step budget; paper: "< 4" (Table 3)
     lr: float = 0.05            # Adam step size in pre-tanh space
-    feasible_tol: float = 1e-6  # feasibility test: sum(z) <= tol
+    feasible_tol: float = 1e-4  # paper: ||eta Z|| <= 1e-4 (Sec. 4.4)
+    feasible_norm: str = "l2"   # see violation_measure
 
     def __post_init__(self):
         if self.mode not in ("r1", "r2"):
             raise ValueError("mode must be 'r1' or 'r2'.")
         if self.K < 0:
             raise ValueError("K must be >= 0.")
+        if self.feasible_norm not in ("l2", "sum"):
+            raise ValueError("feasible_norm must be 'l2' or 'sum'.")
 
 
 @dataclass
@@ -128,7 +148,7 @@ def refine_actions(
 
         with torch.no_grad():
             cost = out.f_sum.detach()
-            viol = out.z.detach().sum(dim=1)
+            viol = violation_measure(out.z.detach(), config.feasible_norm)
             feas = viol <= tol
             valid = out.helm.converged
 

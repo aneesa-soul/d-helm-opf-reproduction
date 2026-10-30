@@ -9,9 +9,11 @@ For each seed:
                    checkpoint for reference
 
 Defaults = the paper protocol (see train_dhelm_case5.py): 20 episodes
-x 25 steps, window 25, ramping 30% of P_max.  With ramping the test set
-is n_states / 25 episodes and the OPF reference is a sequence of
-ramp-limited OPFs per episode (utils/opf_reference.py).
+x 24 steps, window 24, ramping 30% of P_max, R1 with K = 3 (Table 3:
+"< 4 gradient steps").  The test set is 100 profiles x 24 samples =
+2400 states (Table 2); with ramping the OPF reference is a sequence of
+ramp-limited OPFs per profile (utils/opf_reference.py).  Reported per
+profile (Table 2): reward (Eq. 5) and cost summed over the 24 samples.
 
 Outputs (results/experiments/<name>/):
     per_seed.csv   one row per (seed, variant)
@@ -19,9 +21,14 @@ Outputs (results/experiments/<name>/):
     summary.png    gap and feasibility per variant, one dot per seed
 
 Examples:
-    # paper protocol, both OPF references
-    python scripts/run_seeds.py --name paper_protocol
-    python scripts/run_seeds.py --name paper_protocol --fixed-slack-voltage
+    # paper protocol: Fig. 5 (20 episodes) and Table 2 (1000 episodes)
+    python scripts/run_seeds.py --name paper_fig5
+    python scripts/run_seeds.py --name paper_table2 --episodes 1000 --eval-every 50
+    # the same runs against the fixed-slack-voltage OPF
+    python scripts/run_seeds.py --name paper_fig5 --fixed-slack-voltage
+    # the 25-step runs of 2026-10-29 (REPRODUCTION_STATUS.md, Section 10)
+    python scripts/run_seeds.py --name paper_protocol --episode-length 25 \
+        --n-states 1000 --variants last,last+r1:20,last+r2:5,last+r2:20,last+r2:50,last+r2:200,best
     # the earlier extended runs (window 1, no ramping, old layout)
     python scripts/run_seeds.py --name paper_5000 --episodes 200 --window 1 \
         --ramp-frac 0 --voltage-first --n-states 100 \
@@ -78,7 +85,11 @@ def main() -> None:
     p.add_argument("--name", required=True)
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     p.add_argument("--episodes", type=int, default=20)
-    p.add_argument("--window", type=int, default=25)
+    p.add_argument("--episode-length", type=int, default=24)
+    p.add_argument("--window", type=int, default=None,
+                   help="default: the whole episode")
+    p.add_argument("--eval-every", type=int, default=5,
+                   help="validation interval in steps (use ~50 for 1000 episodes)")
     p.add_argument("--ramp-frac", type=float, default=0.3)
     p.add_argument("--voltage-first", action="store_true")
     p.add_argument("--fixed-slack-voltage", action="store_true",
@@ -86,15 +97,18 @@ def main() -> None:
     p.add_argument("--lr-schedule", choices=("constant", "cosine"),
                    default="constant")
     p.add_argument("--variants", type=str,
-                   default="last,last+r1:20,last+r2:5,last+r2:20,"
+                   default="last,last+r1:3,last+r2:5,last+r2:20,"
                            "last+r2:50,last+r2:200,best")
     p.add_argument("--refine-lr", type=float, default=0.03)
-    p.add_argument("--n-states", type=int, default=1000,
-                   help="test states (a multiple of the window)")
+    p.add_argument("--n-states", type=int, default=2400,
+                   help="test states, a multiple of the window "
+                        "(default 100 profiles x 24, Table 2)")
     p.add_argument("--retrain", action="store_true")
     p.add_argument("--runs-dir", type=str, default="results/runs")
     p.add_argument("--out", type=str, default="results/experiments")
     args = p.parse_args()
+    if args.window is None:
+        args.window = args.episode_length
 
     out_dir = Path(args.out) / (args.name + ("_fixed_slack" if args.fixed_slack_voltage else ""))
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -114,7 +128,9 @@ def main() -> None:
         cmd = [
             sys.executable, str(TRAIN_SCRIPT),
             "--episodes", str(args.episodes),
+            "--episode-length", str(args.episode_length),
             "--window", str(args.window),
+            "--eval-every", str(args.eval_every),
             "--ramp-frac", str(args.ramp_frac),
             "--lr-schedule", args.lr_schedule,
             "--seed", str(seed),
@@ -198,10 +214,14 @@ def main() -> None:
 
         g, gs = ms("gap_mean")
         fe, fs = ms("feasible")
+        rp, rps = ms("reward_per_profile_mean")
+        cp, _ = ms("cost_per_profile_mean")
         t, _ = ms("ms_total_per_state")
         row = {"variant": lab, "seeds": len(sel),
                "gap_mean": g, "gap_std": gs,
                "feasible_mean": fe, "feasible_std": fs,
+               "reward_per_profile": rp, "reward_per_profile_std_seeds": rps,
+               "cost_per_profile": cp,
                "ms_per_state": t}
         if "ramp_bind_step_share" in sel[0]:
             row["ramp_bind_step_share"], _ = ms("ramp_bind_step_share")
@@ -217,10 +237,17 @@ def main() -> None:
           f"({args.episodes * 25} steps), window {window}, ramp "
           f"{args.ramp_frac or 'off'}, OPF slack voltage "
           f"{'fixed' if fixed else 'free'}, lr schedule {args.lr_schedule}")
-    print(f"{'variant':20s} {'gap (mean ± std)':>20s} {'feasible':>16s} {'ms/state':>9s}")
+    r0 = rows[0]
+    print(f"OPF reference per profile ({r0['opf_profiles']}/{r0['profiles']} profiles "
+          f"fully solved): reward {r0['opf_reward_per_profile_mean']:.2f}, "
+          f"cost {r0['opf_cost_per_profile_mean']:.4g} $")
+    print(f"{'variant':20s} {'gap (mean ± std)':>20s} {'feasible':>16s} "
+          f"{'reward/profile':>16s} {'cost/profile':>12s} {'ms/state':>9s}")
     for s in summary:
         print(f"{s['variant']:20s} {100 * s['gap_mean']:+8.2f}% ± {100 * s['gap_std']:5.2f}"
               f"   {100 * s['feasible_mean']:6.1f}% ± {100 * s['feasible_std']:4.1f}"
+              f"   {s['reward_per_profile']:6.2f} ± {s['reward_per_profile_std_seeds']:4.2f}"
+              f" {s['cost_per_profile']:12.4g}"
               f" {s['ms_per_state']:9.2f}"
               + (f"   ramp binds {100 * s['ramp_bind_step_share']:5.1f}% of steps"
                  if "ramp_bind_step_share" in s else ""))
