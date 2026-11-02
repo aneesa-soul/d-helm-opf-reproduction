@@ -392,7 +392,27 @@ python scripts/run_seeds.py --name paper_fig5
 python scripts/run_seeds.py --name paper_table2 --episodes 1000 --eval-every 50
 ```
 
-Results: pending.
+Results, 5 seeds, mean ± std over seeds, 2,400 test states (100 profiles × 24), against the matched sequential OPF with the slack voltage free (2,383/2,400 steps solved, mean 9,073 $/h; 84 of the 100 profiles fully solved, used for the per-profile OPF numbers). Runs made on the user's machine (2026-10-30 to 11-02).
+
+| Variant | 20 episodes (480 steps, Fig. 5) | | | 1,000 episodes (Table 2 agents) | | |
+|---|---|---|---|---|---|---|
+| | Gap vs OPF | Feasible | Reward / profile | Gap vs OPF | Feasible | Reward / profile |
+| trained policy (last) | +33.9% ± 14.5 | 90.6% | 39.25 ± 0.88 | **+2.90% ± 0.89** | 97.2% ± 1.4 | 41.14 ± 0.05 |
+| + R1, K = 3 (paper, Remark 5) | +34.4% ± 14.5 | 98.0% | 39.22 | **+2.93% ± 0.88** | **99.4% ± 0.2** | 41.14 |
+| + R2, K = 5 | +24.7% ± 11.9 | 94.3% | 39.80 | +0.92% ± 0.36 | 99.2% | 41.26 |
+| + R2, K = 200 | +17.6% ± 10.2 | 99.4% | 40.23 | **+0.37% ± 0.31** | 99.3% | 41.29 |
+| best checkpoint (reference) | +44.9% ± 28.5 | 93.3% | 38.58 | +3.32% ± 0.49 | 98.9% | 41.12 |
+| OPF reference | – | – | 41.33 | – | – | 41.33 |
+
+Time per state: policy 0.1–0.2 ms, + R1 0.6 ms, + R2 1 ms (K = 5) to 30 ms (K = 200), on the user's machine. Ramp limits bind in 13% of policy steps after 1,000 episodes (3% after 20; OPF reference 55%).
+
+Findings:
+
+* **With the paper's Table 2 training length the policy is near-optimal:** +2.9% above the matched AC-OPF, 97% feasible, with a small spread over seeds (± 0.9). With R1 (3 steps) it is 99.4% feasible at the same cost. The paper's comparable figures (Table 3, 30-bus) are +3.1% learned and +0.6% enhanced against the PP solver, at 99.9% / 100% feasible.
+* **20 episodes are not enough here.** After 480 steps the policy is feasible-leaning (91%) but +34% above the OPF with a large seed spread. The paper's "converges in 20 episodes" is read from its Fig. 5 curves; our curves flatten early as well, but the cost keeps improving long after (see `training.png` of each run).
+* **R1 behaves as the paper describes:** it fixes feasibility (97.2 → 99.4%) without changing cost. It does not reach the paper's 100%; about 0.6% of states remain infeasible after 3 steps.
+* **The paper's "Enhanced" column lowers cost** (30-bus: 1.372 → 1.339 × 10⁴ $, +3.1% → +0.6%), which a feasibility-only refinement (R1) cannot do. That behaviour matches R2 at small K (here +2.9% → +0.9% at K = 5, 1 ms per state), and Sec. 4.4's wording ("parameters … updated for only the operational point") also suggests the refinement optimizes the full objective. So the paper's Enhanced step is probably closer to our R2 at K ≤ 3 than to R1. This is our reading; Remark 5 itself only mentions infeasible states.
+* **Absolute reward and cost are not comparable with Table 2.** Our OPF optimum is 2.18 × 10⁵ $ per 24-sample profile against the paper's policy at 3.74 × 10⁵ $, yet the paper's reward (42.4) is higher than our OPF's (41.33). This points to a different load/wind setup (the missing companion data) and a reward scale about half of ours (1/w_r ≈ 2 f_max). Our policy's reward is 99.5% of the OPF reward.
 
 ### 12. Remaining work
 
@@ -445,8 +465,8 @@ The following are complete and validated:
 
 Results, over 5 seeds against the matched OPF:
 
-* **Reproduction (paper protocol, Section 10):** 500 steps, full-episode LSTM, ramping at 30% of P_max. The trained policy is +40.7% ± 28.8 above the matched OPF; + R1 it is 99.3% feasible at +41.1%. The paper's near-optimality within 500 steps is not reproduced.
-* **Improvement (R2, K = 200) under the paper protocol:** +25.5% ± 27.8 at 99.5% feasibility.
+* **Reproduction (paper protocol, Section 11):** 1,000 episodes × 24 steps, full-episode LSTM, ramping at 30% of P_max. The trained policy is +2.9% ± 0.9 above the matched AC-OPF and 97.2% feasible; with the paper's Remark 5 refinement (3 steps) it is 99.4% feasible at the same cost. After only 20 episodes it is +34% ± 15.
+* **Improvement (R2) under the paper protocol:** +0.92% at K = 5 (1 ms per state) and +0.37% ± 0.31 at K = 200 (30 ms per state), 99.3% feasible.
 * **Extended training (Section 9, not the paper's settings):** 5,000 steps without ramping, +3.5% (R1) and +1.8% ± 0.1 (R2, K = 200).
 
 Next targets are listed in Section 12.

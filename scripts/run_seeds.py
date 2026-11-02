@@ -234,7 +234,7 @@ def main() -> None:
         w.writerows(summary)
 
     print(f"\n{args.name}: {len(args.seeds)} seeds, {args.episodes} episodes "
-          f"({args.episodes * 25} steps), window {window}, ramp "
+          f"({args.episodes * args.episode_length} steps), window {window}, ramp "
           f"{args.ramp_frac or 'off'}, OPF slack voltage "
           f"{'fixed' if fixed else 'free'}, lr schedule {args.lr_schedule}")
     r0 = rows[0]
