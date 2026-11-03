@@ -35,7 +35,7 @@ from pathlib import Path
 import numpy as np
 import pandapower as pp
 
-from dhelm_opf.environment.case5 import build_case5
+from dhelm_opf.environment.cases import get_case
 from dhelm_opf.environment.uncertainty import (
     OperatingScenario,
     UncertaintyConfig,
@@ -76,10 +76,11 @@ def opf_network(
     state: np.ndarray,
     unc: UncertaintyConfig,
     fixed_slack_voltage: bool = False,
+    case: str = "case5",
 ) -> pp.pandapowerNet:
-    """Case5 with the state's demand and wind, prepared for the OPF."""
+    """The test system with the state's demand and wind, prepared for the OPF."""
 
-    net = build_case5()
+    net = get_case(case).build()
     n_d = len(net.load)
 
     scenario = OperatingScenario(
@@ -180,6 +181,7 @@ def compute_reference(
     fixed_slack_voltage: bool = False,
     ramp: RampConfig | None = None,
     episode_length: int | None = None,
+    case: str = "case5",
 ) -> dict:
     """
     Solve the OPF for every state.
@@ -212,7 +214,7 @@ def compute_reference(
         if k % L == 0:
             prev = None                      # episode start
 
-        net = opf_network(s, unc, fixed_slack_voltage)
+        net = opf_network(s, unc, fixed_slack_voltage, case)
         lo = hi = None
 
         if ramp is not None and prev is not None:
@@ -250,6 +252,7 @@ def compute_reference(
         "ramp_frac": np.array([ramp.frac_u, ramp.frac_d] if ramp else [np.nan, np.nan]),
         "episode_length": np.array(L if ramp is not None else 0),
         "pandapower_version": np.array(pp.__version__),
+        "case": np.array(case),
     }
 
 
@@ -262,6 +265,7 @@ def load_or_compute(
     verbose: bool = True,
     ramp: RampConfig | None = None,
     episode_length: int | None = None,
+    case: str = "case5",
 ) -> dict:
     """Load a cached reference for exactly this setup, or compute it."""
 
@@ -279,6 +283,7 @@ def load_or_compute(
             and bool(data["p_first"]) == config.p_first
             and np.array_equal(data["ramp_frac"], want_ramp, equal_nan=True)
             and int(data["episode_length"]) == want_L
+            and str(data.get("case", "case5")) == case
         ):
             return data
         if verbose:
@@ -289,7 +294,7 @@ def load_or_compute(
               f"(cached afterwards in {path}) ...")
 
     data = compute_reference(states, unc, config, fixed_slack_voltage,
-                             ramp, episode_length)
+                             ramp, episode_length, case)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(path, **data)
     return data

@@ -13,7 +13,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from dhelm_opf.algorithms.case5_setup import Case5Agent, make_case5_agent
+from dhelm_opf.algorithms.setup import Agent, make_agent
+
+Case5Agent = Agent  # old name
 from dhelm_opf.algorithms.dhelm_cpo import CPOConfig
 from dhelm_opf.algorithms.refine import RefineConfig, refine_actions, violation_measure
 from dhelm_opf.environment.state_sampler import StateSampler
@@ -61,8 +63,11 @@ def load_agent(run_dir: str | Path, checkpoint: str = "best"):
 
     # Runs made before the Eq. (4) order change (p_g first) have no
     # "p_first" entry and used the voltage-first layout.
-    agent = make_case5_agent(
+    # Runs made before the multi-system code have no "case" (5-bus).
+    agent = make_agent(
+        args.get("case", "case5"),
         seed=args["seed"], cpo_config=CPOConfig(**cpo_config),
+        hidden=args.get("hidden"),
         p_first=args.get("p_first", False), ramp=ramp_from_args(args),
     )
     agent.policy.load_state_dict(ckpt["policy"])
@@ -72,7 +77,7 @@ def load_agent(run_dir: str | Path, checkpoint: str = "best"):
     return agent, ckpt
 
 
-def test_states(agent: Case5Agent, n: int = 100, seed: int = TEST_SEED):
+def test_states(agent: Agent, n: int = 100, seed: int = TEST_SEED):
     """The held-out test states (same draw for every run)."""
 
     sampler = StateSampler(agent.dhelm.n_d, agent.dhelm.n_w,
@@ -80,7 +85,7 @@ def test_states(agent: Case5Agent, n: int = 100, seed: int = TEST_SEED):
     return sampler.sample(n)
 
 
-def check_opf_reference(agent: Case5Agent, ref: dict) -> dict:
+def check_opf_reference(agent: Agent, ref: dict) -> dict:
     """
     Pass the OPF solutions through the critic: cost must match the OPF
     cost and violations must be ~0 (the OPF point is feasible for the
@@ -117,7 +122,7 @@ def check_opf_reference(agent: Case5Agent, ref: dict) -> dict:
     }
 
 
-def ramp_binding(agent: Case5Agent, p_g, p_g_s, episode_length: int,
+def ramp_binding(agent: Agent, p_g, p_g_s, episode_length: int,
                  tol: float = RAMP_BIND_TOL_MW) -> dict:
     """
     How often the Eq. (3) ramp limits bind, over steps t > 0.
@@ -152,7 +157,7 @@ def ramp_binding(agent: Case5Agent, p_g, p_g_s, episode_length: int,
 
 
 def evaluate_policy(
-    agent: Case5Agent,
+    agent: Agent,
     states: np.ndarray,
     window: int,
     ref: dict,
@@ -267,7 +272,7 @@ def evaluate_policy(
     return {"summary": summary, "per_state": per_state}
 
 
-def _rollout_ramped(agent: Case5Agent, states: np.ndarray, window: int,
+def _rollout_ramped(agent: Agent, states: np.ndarray, window: int,
                     refine: RefineConfig | None) -> dict:
     """
     Step-by-step rollout with ramping, optionally refining each step.
@@ -339,8 +344,9 @@ def _rollout_ramped(agent: Case5Agent, states: np.ndarray, window: int,
 def opf_cache_path(n: int, seed: int, fixed_slack_voltage: bool,
                    root: str | Path = "results/opf_reference",
                    ramp: RampConfig | None = None,
-                   episode_length: int | None = None) -> Path:
+                   episode_length: int | None = None,
+                   case: str = "case5") -> Path:
     suffix = "_fixed_slack" if fixed_slack_voltage else ""
     if ramp is not None:
         suffix += f"_ramp{ramp.frac_u:g}-{ramp.frac_d:g}_L{episode_length}"
-    return Path(root) / f"case5_test_seed{seed}_n{n}{suffix}.npz"
+    return Path(root) / f"{case}_test_seed{seed}_n{n}{suffix}.npz"

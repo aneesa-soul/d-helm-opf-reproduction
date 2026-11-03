@@ -1,43 +1,17 @@
 """
-Assemble the 5-bus D-HELM agent: network, action space, D-HELM,
-critic, policy, state sampler and trainer.
-
-One function so that training, evaluation and tests build exactly the
-same setup.
+Backward-compatible 5-bus entry point.  The agent is now assembled for
+any test system by algorithms/setup.py (make_agent).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-import pandapower as pp
-import torch
-
-from dhelm_opf.algorithms.dhelm_cpo import CPOConfig, DHelmCPO
-from dhelm_opf.environment.case5 import build_case5
-from dhelm_opf.environment.state_sampler import StateSampler
-from dhelm_opf.environment.uncertainty import UncertaintyConfig
-from dhelm_opf.helm.differentiable import DHelmNetwork
+from dhelm_opf.algorithms.dhelm_cpo import CPOConfig
+from dhelm_opf.algorithms.setup import Agent, make_agent
 from dhelm_opf.helm.solver import HelmSolverConfig
-from dhelm_opf.models.action_config import (
-    ActionConfig,
-    RampConfig,
-    action_config_from_network,
-)
-from dhelm_opf.models.dhelm_critic import CriticConfig, DHELMCritic
-from dhelm_opf.models.policy import DHelmPolicy
+from dhelm_opf.models.action_config import RampConfig
+from dhelm_opf.models.dhelm_critic import CriticConfig
 
-
-@dataclass
-class Case5Agent:
-    net: pp.pandapowerNet
-    action_config: ActionConfig
-    uncertainty: UncertaintyConfig
-    dhelm: DHelmNetwork
-    critic: DHELMCritic
-    policy: DHelmPolicy
-    sampler: StateSampler
-    cpo: DHelmCPO
+Case5Agent = Agent
 
 
 def make_case5_agent(
@@ -48,44 +22,11 @@ def make_case5_agent(
     hidden: int = 64,
     p_first: bool = True,
     ramp: RampConfig | None = None,
-) -> Case5Agent:
-    """
-    p_first: action order of Eq. (4) (p_g first).  False reproduces the
-             voltage-first layout of runs made before that change.
-    ramp:    Eq. (3) ramp limits; None disables ramping.
-    """
+) -> Agent:
+    """The IEEE 5-bus agent; see make_agent."""
 
-    torch.manual_seed(seed)
-
-    net = build_case5()
-    action_config = action_config_from_network(net, p_first=p_first)
-    uncertainty = UncertaintyConfig()
-
-    dhelm = DHelmNetwork(net, action_config, uncertainty, solver_config,
-                         ramp=ramp)
-    critic = DHELMCritic(dhelm, net, critic_config)
-
-    sampler = StateSampler(dhelm.n_d, dhelm.n_w, uncertainty, seed=seed)
-
-    policy = DHelmPolicy(
-        state_dim=dhelm.state_dim,
-        n_v=action_config.n_v,
-        n_g=action_config.n_g,
-        state_low=sampler.low,
-        state_high=sampler.high,
-        hidden=hidden,
-        idx_p=action_config.generator_action_indices,
-    )
-
-    cpo = DHelmCPO(policy, critic, cpo_config)
-
-    return Case5Agent(
-        net=net,
-        action_config=action_config,
-        uncertainty=uncertainty,
-        dhelm=dhelm,
-        critic=critic,
-        policy=policy,
-        sampler=sampler,
-        cpo=cpo,
+    return make_agent(
+        "case5", seed=seed, cpo_config=cpo_config or CPOConfig(),
+        critic_config=critic_config, solver_config=solver_config,
+        hidden=hidden, p_first=p_first, ramp=ramp,
     )

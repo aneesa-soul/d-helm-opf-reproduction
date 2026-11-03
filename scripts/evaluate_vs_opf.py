@@ -68,10 +68,11 @@ def main() -> None:
     ramp = agent.dhelm.ramp
     cache = args.opf_cache or opf_cache_path(
         args.n_states, args.seed, args.fixed_slack_voltage,
-        ramp=ramp, episode_length=window)
+        ramp=ramp, episode_length=window, case=agent.case.name)
     ref = load_or_compute(cache, states, agent.uncertainty,
                           agent.action_config, args.fixed_slack_voltage,
-                          ramp=ramp, episode_length=window)
+                          ramp=ramp, episode_length=window,
+                          case=agent.case.name)
     check = check_opf_reference(agent, ref)
 
     refine = None
@@ -88,7 +89,7 @@ def main() -> None:
     label = args.refine if refine is None else f"{args.refine} (K={args.refine_K})"
 
     print("=" * 68)
-    print(f"{run_dir.name}  |  checkpoint {args.checkpoint} "
+    print(f"{run_dir.name} ({agent.case.name})  |  checkpoint {args.checkpoint} "
           f"(step {ckpt.get('step', '?')})  |  refinement {label}")
     print(f"{s['states']} test states, window {window}, ramp "
           f"{ckpt['args'].get('ramp_frac') or 'off'}, OPF slack voltage "

@@ -350,7 +350,7 @@ Choices where the paper names something without a number, or is unreadable:
 * The norm in the feasibility test ‖ηZ‖ ≤ 10⁻⁴ (Euclidean), and R1 acting on the actions (Remark 5) rather than the policy weights (Sec. 4.4).
 * Policy input "+4" = the previous p_g of G_ns (Table 1 symbol unreadable).
 * η_n = 1/(x̄ − x̲), w_r = 1/f_max, η_λ = 1, λ_max = 1,000 (Section 7–8).
-* Wind buses 1 and 4 (Section 5).
+* Wind farms: 5-bus buses 1 and 4 (2 × 100 MW); 30-bus buses 6, 7, 11, 20 (4 × 9.46 MW). Same rule for both: load buses, total rating 20% of nominal load (Section 12).
 * Action order inside the p_g and |v| blocks: by bus, `gen` before `sgen`.
 
 Matching the OPF reference to the paper's problem (not a change to the method): unrated lines unconstrained, slack voltage free, sequential OPF with the same ramp windows.
@@ -414,7 +414,39 @@ Findings:
 * **The paper's "Enhanced" column lowers cost** (30-bus: 1.372 → 1.339 × 10⁴ $, +3.1% → +0.6%), which a feasibility-only refinement (R1) cannot do. That behaviour matches R2 at small K (here +2.9% → +0.9% at K = 5, 1 ms per state), and Sec. 4.4's wording ("parameters … updated for only the operational point") also suggests the refinement optimizes the full objective. So the paper's Enhanced step is probably closer to our R2 at K ≤ 3 than to R1. This is our reading; Remark 5 itself only mentions infeasible states.
 * **Absolute reward and cost are not comparable with Table 2.** Our OPF optimum is 2.18 × 10⁵ $ per 24-sample profile against the paper's policy at 3.74 × 10⁵ $, yet the paper's reward (42.4) is higher than our OPF's (41.33). This points to a different load/wind setup (the missing companion data) and a reward scale about half of ours (1/w_r ≈ 2 f_max). Our policy's reward is 99.5% of the OPF reward.
 
-### 12. Remaining work
+### 12. IEEE 30-bus system
+
+**Status: Implemented and validated; training runs pending.**
+
+The code now builds the agent for any test system in `environment/cases.py` (`algorithms/setup.py`, `make_agent(case)`); `--case case30` selects the 30-bus system in the training and evaluation scripts. The 5-bus results are unchanged (regression check bit-identical).
+
+From the paper (Table 1, Sec. 4):
+
+* **Network: pandapower `case30`** (MATPOWER case30). Table 1's 20 × 2 demand uncertainties and HELM output 2(|B| + |G| + |L|) = 2(30 + 6 + 41) = 154 match it; `case_ieee30` has 21 loads. 6 units (5 gen + ext_grid), 41 lines, no transformers; real line ratings (0.07–0.56 kA) and voltage limits 0.95–1.1 p.u. (slack 0.95–1.05) from the case data.
+* **Dimensions:** state 20 × 2 + 4 = 44, policy input 44 + 5, policy output 6 + 5 (5 p_g, 6 |v|), 113 constraints in z (24 PQ voltages, slack P, 6 bus Q, 41 × 2 line currents).
+* **Learning:** LSTM 64 → 64 → 64, SELU, minibatch 64, lr 1e-3 (Table 1); 2,000 episodes for the Table 2 agents (Sec. 4.2).
+* **Targets (Table 3, 1,000 profiles × 24, PP solver):** PP 1.331 × 10⁴ $/day at 97.26% feasible; learned 1.372 × 10⁴ $ (+3.1%), 99.91%; enhanced 1.339 × 10⁴ $ (+0.6%), 100%.
+
+Our choices:
+
+* **Wind farms (companion data unavailable).** Rule, applied to both systems: farms at load buses, total rated wind = 20% of the nominal total active load, split equally. 30-bus: the four largest-load PQ buses, 0-based 6, 7, 11, 20 (MATPOWER 7, 8, 12, 21), 4 × 9.46 MW. (5-bus: buses 1 and 4, 2 × 100 MW, the same 20%.)
+* **Ramping** as for 5-bus: 30% of P_max per step.
+* **OPF references:** slack voltage free (matched to the policy's actions) and fixed (pandapower's default, likely closer to the paper's "PP with its default settings"); both reported.
+
+Calibration note: with loads uniform in 60–110% and **no** wind, our 30-bus OPF averages 473 $/h, below the paper's PP average of 554.6 $/h (1.331 × 10⁴ $/day). The paper's operating points are therefore more heavily loaded than independent uniform samples, as for 5-bus (Section 11). Absolute costs are not comparable; the gap against the OPF and the feasibility are.
+
+Validation (`scripts/test_case30.py`): Table 1 dimensions; critic vs pandapower on 30 random states and actions (slack P and unit Q to 10⁻⁸ MW/MVAr, voltages and currents to 10⁻¹⁰, all 113 z entries to 10⁻⁷); gradcheck; the sequential ramp-limited OPF reference (OPF@critic cost error 10⁻³ $/h, Σz 10⁻⁷); a short training run.
+
+Commands:
+
+```
+python scripts/run_seeds.py --case case30 --name c30_fig6
+python scripts/run_seeds.py --case case30 --name c30_table2 --episodes 2000 --eval-every 100
+```
+
+Results: pending.
+
+### 13. Remaining work
 
 * A constrained refinement using the critic's exact Jacobians (SQP or augmented Lagrangian) to remove R2's boundary crawl.
 * Training-side improvements toward the paper's 500-step claim (Section 10 shows the gap and the large seed variance), such as learning rate and network size. Since the optimum often lies at action bounds, the tanh parametrization (Eq. 18) is worth examining.
@@ -469,4 +501,4 @@ Results, over 5 seeds against the matched OPF:
 * **Improvement (R2) under the paper protocol:** +0.92% at K = 5 (1 ms per state) and +0.37% ± 0.31 at K = 200 (30 ms per state), 99.3% feasible.
 * **Extended training (Section 9, not the paper's settings):** 5,000 steps without ramping, +3.5% (R1) and +1.8% ± 0.1 (R2, K = 200).
 
-Next targets are listed in Section 12.
+Next targets are listed in Section 13.

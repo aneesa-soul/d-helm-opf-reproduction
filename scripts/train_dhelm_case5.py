@@ -1,5 +1,6 @@
 """
-Train the D-HELM policy on the IEEE 5-bus case.
+Train the D-HELM policy on one test system (default the IEEE 5-bus case;
+--case case30 for the 30-bus system).
 
 Loop (paper Fig. 2b; Table 1 for the 5-bus hyperparameters):
 
@@ -34,6 +35,8 @@ Defaults = the paper protocol (Table 1 and Sec. 3.1):
 Examples:
     # paper protocol, Fig. 5 (20 episodes)
     python scripts/train_dhelm_case5.py --seed 0 --name paper_s0
+    # 30-bus system, Table 2 agents (2000 episodes; batch 64 from Table 1)
+    python scripts/train_dhelm_case5.py --case case30 --seed 0 --episodes 2000 --eval-every 100 --name c30_t2_s0
     # paper protocol, Table 2 agents (1000 episodes for the 5-bus system)
     python scripts/train_dhelm_case5.py --seed 0 --episodes 1000 --eval-every 50 --name t2_s0
     # the earlier extended runs (no ramping, single-step windows)
@@ -54,7 +57,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from dhelm_opf.algorithms.case5_setup import make_case5_agent
+from dhelm_opf.algorithms.setup import make_agent
+from dhelm_opf.environment.cases import get_case
 from dhelm_opf.algorithms.dhelm_cpo import CPOConfig
 from dhelm_opf.environment.state_sampler import StateBuffer, StateSampler
 from dhelm_opf.utils.evaluation import ramp_from_args
@@ -63,6 +67,8 @@ from dhelm_opf.utils.evaluation import ramp_from_args
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--case", default="case5",
+                   help="test system in environment/cases.py (case5, case30)")
     p.add_argument("--episodes", type=int, default=20)
     p.add_argument("--episode-length", type=int, default=24)
     p.add_argument("--window", type=int, default=None,
@@ -74,8 +80,12 @@ def parse_args(argv=None):
     p.add_argument("--voltage-first", action="store_true",
                    help="old action layout (|v| before p_g); default is "
                         "Eq. (4): p_g first")
-    p.add_argument("--batch-size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--batch-size", type=int, default=None,
+                   help="default: the case's Table 1 minibatch")
+    p.add_argument("--lr", type=float, default=None,
+                   help="default: the case's Table 1 learning rate")
+    p.add_argument("--hidden", type=int, default=None,
+                   help="policy width; default: the case's Table 1 layers")
     p.add_argument("--eta-lam", type=float, default=1.0,
                    help="eta_lam, Eq. (20)")
     p.add_argument("--lam-max", type=float, default=1000.0,
@@ -103,6 +113,10 @@ def parse_args(argv=None):
 def main(argv=None) -> Path:
 
     args = parse_args(argv)
+    spec = get_case(args.case)
+    args.batch_size = args.batch_size or spec.batch_size
+    args.lr = args.lr or spec.lr
+    args.hidden = args.hidden or spec.hidden
     if args.window is None:
         args.window = args.episode_length
     if args.eval_size is None:
@@ -111,7 +125,7 @@ def main(argv=None) -> Path:
     if args.ramp_frac and args.window < 2:
         print("note: ramping with window 1 has no previous step inside a "
               "window, so the ramp limit never applies.")
-    name = args.name or f"case5_L{args.window}_seed{args.seed}"
+    name = args.name or f"{args.case}_L{args.window}_seed{args.seed}"
     out_dir = Path(args.out) / name
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -123,8 +137,9 @@ def main(argv=None) -> Path:
         lam_max=args.lam_max,
     )
 
-    agent = make_case5_agent(
-        seed=args.seed, cpo_config=cpo_config, p_first=args.p_first,
+    agent = make_agent(
+        args.case, seed=args.seed, cpo_config=cpo_config,
+        hidden=args.hidden, p_first=args.p_first,
         ramp=ramp_from_args(vars(args)),
     )
     cpo, sampler = agent.cpo, agent.sampler

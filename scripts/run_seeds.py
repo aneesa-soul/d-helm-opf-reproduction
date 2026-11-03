@@ -21,6 +21,9 @@ Outputs (results/experiments/<name>/):
     summary.png    gap and feasibility per variant, one dot per seed
 
 Examples:
+    # 30-bus system: Fig. 6 (20 episodes) and Table 2 (2000 episodes)
+    python scripts/run_seeds.py --case case30 --name c30_fig6
+    python scripts/run_seeds.py --case case30 --name c30_table2 --episodes 2000 --eval-every 100
     # paper protocol: Fig. 5 (20 episodes) and Table 2 (1000 episodes)
     python scripts/run_seeds.py --name paper_fig5
     python scripts/run_seeds.py --name paper_table2 --episodes 1000 --eval-every 50
@@ -83,6 +86,8 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--name", required=True)
+    p.add_argument("--case", default="case5",
+                   help="test system (case5, case30)")
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     p.add_argument("--episodes", type=int, default=20)
     p.add_argument("--episode-length", type=int, default=24)
@@ -128,6 +133,7 @@ def main() -> None:
         cmd = [
             sys.executable, str(TRAIN_SCRIPT),
             "--episodes", str(args.episodes),
+            "--case", args.case,
             "--episode-length", str(args.episode_length),
             "--window", str(args.window),
             "--eval-every", str(args.eval_every),
@@ -153,9 +159,9 @@ def main() -> None:
     fixed = args.fixed_slack_voltage
     ref = load_or_compute(
         opf_cache_path(args.n_states, TEST_SEED, fixed, ramp=ramp,
-                       episode_length=window),
+                       episode_length=window, case=agent.case.name),
         states, agent.uncertainty, agent.action_config, fixed,
-        ramp=ramp, episode_length=window,
+        ramp=ramp, episode_length=window, case=agent.case.name,
     )
     check = check_opf_reference(agent, ref)
     print(f"[opf] {check['opf_converged']}/{args.n_states} converged; "
@@ -233,7 +239,7 @@ def main() -> None:
         w.writeheader()
         w.writerows(summary)
 
-    print(f"\n{args.name}: {len(args.seeds)} seeds, {args.episodes} episodes "
+    print(f"\n{args.name} ({agent.case.name}): {len(args.seeds)} seeds, {args.episodes} episodes "
           f"({args.episodes * args.episode_length} steps), window {window}, ramp "
           f"{args.ramp_frac or 'off'}, OPF slack voltage "
           f"{'fixed' if fixed else 'free'}, lr schedule {args.lr_schedule}")

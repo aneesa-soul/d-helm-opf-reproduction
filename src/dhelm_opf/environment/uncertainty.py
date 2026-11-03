@@ -27,7 +27,9 @@ The paper specifies:
     wind scaling    : [0.40, 1.00]
 
 The exact wind-bus placement is kept configurable because the
-paper refers to its electronic companion for those placements.
+paper refers to its electronic companion for those placements.  The
+per-system choices are in environment/cases.py; the defaults below are
+the 5-bus ones.
 """
 
 from __future__ import annotations
@@ -97,18 +99,8 @@ def validate_uncertainty_config(
         8 total uncertainty variables
     """
 
-    if len(net.load) != 3:
-        raise ValueError(
-            "The paper's 5-bus configuration expects "
-            f"3 demand entries, but the network has {len(net.load)}."
-        )
-
-    if len(config.B_w) != 2:
-        raise ValueError(
-            "The paper's 5-bus configuration requires exactly "
-            "2 wind buses. Supply their exact indices from the "
-            "electronic companion."
-        )
+    if len(config.B_w) != len(config.p_w_rated_mw):
+        raise ValueError("B_w and p_w_rated_mw must have equal length.")
 
     n_bus = len(net.bus)
 
@@ -116,7 +108,7 @@ def validate_uncertainty_config(
         if bus < 0 or bus >= n_bus:
             raise ValueError(
                 f"Wind bus index {bus} is outside the "
-                f"5-bus network range [0, {n_bus - 1}]."
+                f"network range [0, {n_bus - 1}]."
             )
 
     if not 0.0 <= config.demand_min <= config.demand_max:
@@ -129,9 +121,11 @@ def validate_uncertainty_config(
 def sample_scenario(
     config: UncertaintyConfig,
     rng: np.random.Generator,
+    n_d: int = 3,
 ) -> OperatingScenario:
     """
-    Sample one realization of demand and wind uncertainty.
+    Sample one realization of demand and wind uncertainty for a network
+    with n_d loads (3 for the 5-bus system).
 
     Demand:
         [0.60, 1.10]
@@ -140,28 +134,24 @@ def sample_scenario(
         [0.40, 1.00]
     """
 
-    if len(config.B_w) != 2:
-        raise ValueError(
-            "Two exact wind buses must be configured before "
-            "sampling a 5-bus scenario."
-        )
+    n_w = len(config.B_w)
 
     p_d_scale = rng.uniform(
         config.demand_min,
         config.demand_max,
-        size=3,
+        size=n_d,
     )
 
     q_d_scale = rng.uniform(
         config.demand_min,
         config.demand_max,
-        size=3,
+        size=n_d,
     )
 
     p_w_scale = rng.uniform(
         config.wind_min,
         config.wind_max,
-        size=2,
+        size=n_w,
     )
 
     return OperatingScenario(
@@ -296,20 +286,17 @@ def scenario_to_state(
     scenario: OperatingScenario,
 ) -> np.ndarray:
     """
-    Construct the 8-dimensional uncertainty state.
+    Construct the uncertainty state, |D| x 2 + |W| values (Table 1).
 
     Ordering:
 
-        [p_d(3), q_d(3), p_w(2)]
+        [p_d(|D|), q_d(|D|), p_w(|W|)]
 
     The wind values are the normalized realized outputs.
     """
 
-    if len(net.load) != 3:
-        raise ValueError("Expected 3 loads for the 5-bus case.")
-
-    if len(scenario.p_w_scale) != 2:
-        raise ValueError("Expected 2 wind values for the 5-bus case.")
+    if len(net.load) != len(scenario.p_d_scale):
+        raise ValueError("Scenario size does not match the number of loads.")
 
     state = np.concatenate(
         [
@@ -318,12 +305,6 @@ def scenario_to_state(
             scenario.p_w_scale,
         ]
     )
-
-    if state.shape != (8,):
-        raise RuntimeError(
-            f"Expected an 8-dimensional uncertainty state, "
-            f"got shape {state.shape}."
-        )
 
     return state.astype(np.float64)
 
