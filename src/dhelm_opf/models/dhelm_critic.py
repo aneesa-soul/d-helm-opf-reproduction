@@ -57,7 +57,7 @@ import numpy as np
 import pandapower as pp
 import torch
 
-from dhelm_opf.helm.differentiable import DTYPE, DHelmNetwork, DHelmOutput
+from dhelm_opf.helm.differentiable import DTYPE, DHelmNetwork, DHelmOutput, complex_abs
 
 
 @dataclass(frozen=True)
@@ -263,7 +263,10 @@ class DHELMCritic(torch.nn.Module):
         def mag(Y_br_re, Y_br_im, I_base):
             i_re = v_re @ Y_br_re.T - v_im @ Y_br_im.T
             i_im = v_im @ Y_br_re.T + v_re @ Y_br_im.T
-            return torch.sqrt(i_re ** 2 + i_im ** 2) * I_base
+            # complex_abs: a line current can be exactly 0 (30-bus line
+            # 8-10 feeds a dead-end bus with no load), where sqrt's
+            # gradient would be NaN.
+            return complex_abs(i_re, i_im) * I_base
 
         return (
             mag(self.Y_f_re, self.Y_f_im, self.I_base_f),

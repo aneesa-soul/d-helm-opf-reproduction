@@ -60,6 +60,24 @@ from dhelm_opf.helm.solver import HelmSolverConfig
 from dhelm_opf.models.action_config import ActionConfig, RampConfig
 
 
+def complex_abs(re: torch.Tensor, im: torch.Tensor) -> torch.Tensor:
+    """
+    |re + j im| with a usable gradient everywhere.
+
+    torch.sqrt has an infinite derivative at 0, which turns into NaN in
+    the backward pass when a magnitude is exactly zero (e.g. the current
+    of a dead-end line with no load, 30-bus line 8-10).  Where the
+    squared magnitude is exactly 0 this returns 0 with gradient 0 (a
+    valid subgradient); everywhere else the value and the gradient are
+    those of torch.sqrt, bit for bit.
+    """
+
+    sq = re ** 2 + im ** 2
+    pos = sq > 0
+    return torch.where(pos, torch.sqrt(torch.where(pos, sq, torch.ones_like(sq))),
+                       torch.zeros_like(sq))
+
+
 DTYPE = torch.float64
 
 
@@ -428,11 +446,9 @@ class DHelmNetwork(torch.nn.Module):
 
         B_q, B_v = self.B_q_idx, self.B_v_idx
 
-        err_14b = torch.sqrt(
-            (e_re[:, B_q] - specs.p[:, B_q]) ** 2
-            + (e_im[:, B_q] - specs.q[:, B_q]) ** 2
-        )
-        v_abs_v = torch.sqrt(v_re[:, B_v] ** 2 + v_im[:, B_v] ** 2)
+        err_14b = complex_abs(e_re[:, B_q] - specs.p[:, B_q],
+                              e_im[:, B_q] - specs.q[:, B_q])
+        v_abs_v = complex_abs(v_re[:, B_v], v_im[:, B_v])
         err_14a = torch.abs(v_abs_v - specs.v_sp[:, B_v])
         err_14c = torch.abs(e_re[:, B_v] - specs.p[:, B_v])
 
@@ -592,7 +608,7 @@ class DHelmNetwork(torch.nn.Module):
                 break
 
         e_re, e_im = self.compute_e(v_re, v_im)
-        v_abs = torch.sqrt(v_re ** 2 + v_im ** 2)
+        v_abs = complex_abs(v_re, v_im)
         q_v = torch.stack(Q, dim=0).sum(dim=0)
 
         return DHelmOutput(

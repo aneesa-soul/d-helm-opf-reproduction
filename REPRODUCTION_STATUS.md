@@ -435,6 +435,8 @@ Our choices:
 
 Calibration note: with loads uniform in 60–110% and **no** wind, our 30-bus OPF averages 473 $/h, below the paper's PP average of 554.6 $/h (1.331 × 10⁴ $/day). The paper's operating points are therefore more heavily loaded than independent uniform samples, as for 5-bus (Section 11). Absolute costs are not comparable; the gap against the OPF and the feasibility are.
 
+Numerical note: line 12 (bus 8 to bus 10) feeds a dead-end bus with no load and no generator and has no charging, so its current is physically zero. On some CPUs it is computed as exactly 0.0, where the gradient of √(re² + im²) is NaN; this made every policy gradient NaN at the first step on the user's machine (AVX2, torch 2.14.1+cpu). All magnitudes now go through `complex_abs`, which equals `torch.sqrt` bit for bit except at exactly 0, where its gradient is 0; training also stops with an error on any non-finite gradient.
+
 Validation (`scripts/test_case30.py`): Table 1 dimensions; critic vs pandapower on 30 random states and actions (slack P and unit Q to 10⁻⁸ MW/MVAr, voltages and currents to 10⁻¹⁰, all 113 z entries to 10⁻⁷); gradcheck; the sequential ramp-limited OPF reference (OPF@critic cost error 10⁻³ $/h, Σz 10⁻⁷); a short training run.
 
 Commands:

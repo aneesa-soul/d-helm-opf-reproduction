@@ -215,6 +215,17 @@ class DHelmCPO:
         self.optimizer.zero_grad()
         loss.backward()
 
+        # Stop instead of silently writing NaN into the policy.
+        if not torch.isfinite(loss) or any(
+            p.grad is not None and not bool(torch.isfinite(p.grad).all())
+            for p in self.policy.parameters()
+        ):
+            raise FloatingPointError(
+                "Non-finite loss or gradient in train_step; the policy was "
+                "not updated. Re-run scripts/test_case30.py / the diagnostic "
+                "to locate the operation."
+            )
+
         if self.config.grad_clip is not None:
             torch.nn.utils.clip_grad_norm_(
                 self.policy.parameters(), self.config.grad_clip

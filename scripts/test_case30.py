@@ -12,6 +12,9 @@ Tests for the IEEE 30-bus system (pandapower case30).
 4. Sequential ramp-limited OPF reference: solves, respects ramps, and its
    solutions pass through the critic with matching cost and z ~ 0.
 5. A short ramped training run on case30 runs and lowers the loss.
+6. Exactly-zero magnitudes have a finite gradient.  Line 8-10 feeds a
+   dead-end bus with no load, so its current is physically 0; on some
+   CPUs it is computed as exactly 0.0, where sqrt's gradient is NaN.
 
 Run:
     python scripts/test_case30.py
@@ -39,6 +42,7 @@ from dhelm_opf.environment.uncertainty import (  # noqa: E402
     apply_demand_uncertainty,
     apply_wind_output,
 )
+from dhelm_opf.helm.differentiable import complex_abs  # noqa: E402
 from dhelm_opf.helm.solver import HelmSolverConfig  # noqa: E402
 from dhelm_opf.models.action_config import RampConfig  # noqa: E402
 from dhelm_opf.models.action_decoder import (  # noqa: E402
@@ -178,6 +182,26 @@ def test_training_smoke() -> None:
     print(f"  5. training smoke run (20 steps)  : OK (loss {l0:.3f} -> {l1:.3f})")
 
 
+def test_zero_magnitude(agent) -> None:
+
+    # helper: same values as sqrt where nonzero, gradient 0 at exactly 0
+    re = torch.tensor([0.0, 3.0, -1e-9], dtype=F64, requires_grad=True)
+    im = torch.tensor([0.0, 4.0, 0.0], dtype=F64, requires_grad=True)
+    m = complex_abs(re, im)
+    assert torch.equal(m[1:], torch.sqrt(re[1:] ** 2 + im[1:] ** 2))
+    m.sum().backward()
+    assert bool(torch.isfinite(re.grad).all() and torch.isfinite(im.grad).all())
+    assert re.grad[0] == 0 and im.grad[0] == 0
+
+    # the dead-end line carries (numerically) no current
+    k = [i for i, n in enumerate(agent.critic.constraint_names) if n.startswith("i_f[")]
+    out = agent.critic(as_t(np.full((2, 44), 0.8)), torch.zeros(2, 11, dtype=F64))
+    n_zero = int((out.i_f.abs() < 1e-12).any(0).sum())
+    assert n_zero >= 1
+    print(f"  6. zero-magnitude gradient       : OK ({n_zero} line(s) with ~0 current; "
+          f"{len(k)} line-current constraints)")
+
+
 def main() -> None:
 
     torch.manual_seed(0)
@@ -191,6 +215,7 @@ def main() -> None:
     test_gradcheck(agent, rng)
     test_sequential_opf()
     test_training_smoke()
+    test_zero_magnitude(agent)
     print("All 30-bus tests passed.")
 
 
