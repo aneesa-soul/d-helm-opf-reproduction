@@ -183,9 +183,21 @@ class DHelmNetwork(torch.nn.Module):
             )
 
         if float(net.ext_grid.iloc[0]["va_degree"]) != 0.0:
-            raise ValueError(
-                "The paper's slack row (|v_sp| - 1) assumes a 0° slack angle."
+            # The paper's slack row (|v_sp| - 1) assumes a 0° slack angle.
+            # Without phase shifters, a uniform angle shift changes no
+            # magnitude, power, current or cost (only the angle reference),
+            # so the reference is moved to 0° (case118: 30°).
+            shifters = (
+                (len(net.trafo) and bool((net.trafo["shift_degree"] != 0).any()))
+                or len(net.trafo3w) > 0
             )
+            if shifters:
+                raise ValueError(
+                    "Nonzero slack angle with phase-shifting transformers is "
+                    "not supported."
+                )
+            net.ext_grid["va_degree"] = 0.0
+            pp.runpp(net)
 
         problem = build_helm_problem_from_network(net)
         A, _, Y_sh = build_A(problem)

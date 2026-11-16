@@ -191,17 +191,25 @@ class DHELMCritic(torch.nn.Module):
         # ------------------------------------------------------------
         # (16d)-(16e) line currents
         # ------------------------------------------------------------
+        # Only LINES carry the (16d)-(16e) limits: the paper's HELM output
+        # count 2(|B| + |G| + |L|) matches the line count of case118 and
+        # case300, not lines + transformers.  pandapower puts the lines
+        # first in its branch table; transformer rows are skipped.
         lookup = net._pd2ppc_lookups["branch"]
-        if set(lookup) != {"line"} or lookup["line"] != (0, len(net.line)):
+        n_line = len(net.line)
+        if (
+            "line" in lookup and lookup["line"] != (0, n_line)
+        ) or not bool(net.line["in_service"].all()) or (
+            len(net.trafo) and not bool(net.trafo["in_service"].all())
+        ):
             raise ValueError(
-                "Only networks whose branches are all lines (in net.line "
-                "order) are supported so far; transformers need their "
-                "own Y_f/Y_t rows and base current."
+                "Expected all branches in service with the lines first in "
+                "pandapower's branch table."
             )
 
         ppc = net._ppc["internal"]
-        Y_f = ppc["Yf"].toarray()
-        Y_t = ppc["Yt"].toarray()
+        Y_f = ppc["Yf"].toarray()[:n_line]
+        Y_t = ppc["Yt"].toarray()[:n_line]
 
         self.register_buffer("Y_f_re", t(np.real(Y_f)))
         self.register_buffer("Y_f_im", t(np.imag(Y_f)))
