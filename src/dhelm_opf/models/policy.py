@@ -18,7 +18,9 @@ Reproduction choices
 * The "+4" extra inputs are the previous NORMALIZED active-power
   actions of the non-slack generators (|G / G_s| = 4).  Table 1's
   symbol is unreadable in the PDF; |G / G_s| fits the 5- and 30-bus
-  columns exactly.
+  columns exactly.  For the 118- and 300-bus systems Table 1 gives
+  +54 / +69 = |G|, all units: there the previous SLACK output is added
+  as one more input (prev_slack=True), following Table 1 row by row.
 * Autoregressive: over a window of L states, the policy feeds its own
   previous generator action back as input.  At the start of a window
   the previous action is 0 (the middle of each generator's range).
@@ -50,6 +52,11 @@ class DHelmPolicy(nn.Module):
         Positions of the p_g actions in the output (ActionConfig.
         generator_action_indices).  Default: after the voltages (the
         pre-Eq.-4 layout).
+    prev_slack:
+        Also feed the previous slack output (normalized by its static
+        range, clipped to [-1, 1]) as input; Table 1, 118/300-bus.  It
+        is not an action, so it comes from the critic: only the
+        step-by-step rollout in DHelmCPO / evaluation supplies it.
     """
 
     def __init__(
@@ -61,6 +68,7 @@ class DHelmPolicy(nn.Module):
         state_high,
         hidden: int = 64,
         idx_p=None,
+        prev_slack: bool = False,
     ) -> None:
 
         super().__init__()
@@ -69,7 +77,9 @@ class DHelmPolicy(nn.Module):
         self.n_v = n_v
         self.n_g = n_g
         self.action_dim = n_v + n_g
-        self.input_dim = state_dim + n_g
+        self.prev_slack = bool(prev_slack)
+        self.n_prev = n_g + int(self.prev_slack)
+        self.input_dim = state_dim + self.n_prev
         self.idx_p = list(idx_p) if idx_p is not None else list(range(n_v, n_v + n_g))
 
         self.register_buffer(
@@ -99,7 +109,8 @@ class DHelmPolicy(nn.Module):
         One time step.
 
         s_t:           (B, state_dim)  state s_t (Eq. 2)
-        a_hat_g_prev:  (B, n_g)        normalized p_g actions of step t-1
+        a_hat_g_prev:  (B, n_prev)     normalized p_g of step t-1 (G_ns,
+                                       then the slack if prev_slack)
         hc:            LSTM state or None
 
         Returns (a_hat_t = tanh(logit_t), new hc); a_hat_t in [-1, 1]
@@ -128,6 +139,12 @@ class DHelmPolicy(nn.Module):
 
         Returns a_hat: (B, L, action_dim) normalized actions.
         """
+
+        if self.prev_slack:
+            raise RuntimeError(
+                "With prev_slack the previous slack output comes from the "
+                "critic; use DHelmCPO.evaluate (step-by-step rollout)."
+            )
 
         if s.dim() == 2:
             s = s.unsqueeze(1)

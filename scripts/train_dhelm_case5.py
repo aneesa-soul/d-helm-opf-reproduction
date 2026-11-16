@@ -35,6 +35,8 @@ Defaults = the paper protocol (Table 1 and Sec. 3.1):
 Examples:
     # paper protocol, Fig. 5 (20 episodes)
     python scripts/train_dhelm_case5.py --seed 0 --name paper_s0
+    # 118-bus system on the GPU (batch 128, lr 5e-4, width 128 from Table 1)
+    python scripts/train_dhelm_case5.py --case case118 --device cuda --seed 0 --episodes 3000 --eval-every 200 --name c118_t2_s0
     # 30-bus system, Table 2 agents (2000 episodes; batch 64 from Table 1)
     python scripts/train_dhelm_case5.py --case case30 --seed 0 --episodes 2000 --eval-every 100 --name c30_t2_s0
     # paper protocol, Table 2 agents (1000 episodes for the 5-bus system)
@@ -68,7 +70,10 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--case", default="case5",
-                   help="test system in environment/cases.py (case5, case30)")
+                   help="test system in environment/cases.py "
+                        "(case5, case30, case118, case300)")
+    p.add_argument("--device", default="cpu",
+                   help="cpu or cuda (training only; evaluation runs on the CPU)")
     p.add_argument("--episodes", type=int, default=20)
     p.add_argument("--episode-length", type=int, default=24)
     p.add_argument("--window", type=int, default=None,
@@ -140,7 +145,7 @@ def main(argv=None) -> Path:
     agent = make_agent(
         args.case, seed=args.seed, cpo_config=cpo_config,
         hidden=args.hidden, p_first=args.p_first,
-        ramp=ramp_from_args(vars(args)),
+        ramp=ramp_from_args(vars(args)), device=args.device,
     )
     cpo, sampler = agent.cpo, agent.sampler
 
@@ -178,7 +183,7 @@ def main(argv=None) -> Path:
     def snapshot(m):
         return {
             "policy": copy.deepcopy(agent.policy.state_dict()),
-            "lam": cpo.lam.clone(),
+            "lam": cpo.lam.detach().cpu().clone(),
             "step": m["step"],
             "f_sum": m["f_sum"],
             "feasible": m["feasible"],
@@ -242,7 +247,7 @@ def main(argv=None) -> Path:
     }
 
     torch.save(
-        {"policy": agent.policy.state_dict(), "lam": cpo.lam,
+        {"policy": agent.policy.state_dict(), "lam": cpo.lam.detach().cpu(),
          "step": step, **common},
         out_dir / "policy.pt",
     )

@@ -81,9 +81,12 @@ class DHelmCPO:
         self.critic = critic
         self.config = config or CPOConfig()
 
+        self.device = critic.dhelm.A_LU.device
+
         n_con = len(critic.constraint_names)
         self.lam = torch.full(
-            (n_con,), self.config.lam_0, dtype=torch.float64
+            (n_con,), self.config.lam_0, dtype=torch.float64,
+            device=self.device,
         )
 
         self.optimizer = torch.optim.Adam(
@@ -100,8 +103,9 @@ class DHelmCPO:
 
         if s.dim() == 2:
             s = s.unsqueeze(1)
+        s = s.to(self.device)
 
-        if self.critic.ramping:
+        if self.critic.ramping or self.policy.prev_slack:
             return self._rollout_with_ramping(s)
 
         a_hat = self.policy(s)                        # (B, L, a)
@@ -143,11 +147,13 @@ class DHelmCPO:
         B, L, _ = s.shape
 
         s = s.to(policy.state_low.dtype)
-        P_min = torch.as_tensor(acfg.P_min, dtype=torch.float64)
-        P_max = torch.as_tensor(acfg.P_max, dtype=torch.float64)
+        dev = s.device
+        P_min = torch.as_tensor(acfg.P_min, dtype=torch.float64, device=dev)
+        P_max = torch.as_tensor(acfg.P_max, dtype=torch.float64, device=dev)
+        P_min_s, P_max_s = acfg.G_s.P_min, acfg.G_s.P_max
 
         hc = None
-        prev_in = s.new_zeros(B, policy.n_g)
+        prev_in = s.new_zeros(B, policy.n_prev)
         p_g_prev, p_g_s_prev = None, None
 
         a_hat, r, f_sum, z, conv, p_g, p_g_s = [], [], [], [], [], [], []
@@ -172,6 +178,10 @@ class DHelmCPO:
 
             p_g_prev, p_g_s_prev = out.p_g, out.p_g_s
             prev_in = (2.0 * (out.p_g - P_min) / (P_max - P_min) - 1.0).to(s.dtype)
+            if policy.prev_slack:
+                prev_s = (2.0 * (out.p_g_s - P_min_s) / (P_max_s - P_min_s) - 1.0)
+                prev_in = torch.cat(
+                    [prev_in, prev_s.clamp(-1.0, 1.0).to(s.dtype).unsqueeze(1)], dim=1)
 
         # Order (b, t), matching the reshape of the non-ramping path.
         return Evaluation(
@@ -206,7 +216,7 @@ class DHelmCPO:
         the multiplier update.  Returns scalar metrics for logging.
         """
 
-        s = torch.as_tensor(s, dtype=torch.float32)
+        s = torch.as_tensor(s, dtype=torch.float32, device=self.device)
 
         self.policy.train()
         ev = self.evaluate(s)
@@ -243,7 +253,7 @@ class DHelmCPO:
     def evaluate_metrics(self, s) -> dict:
         """Metrics on a batch without updating anything."""
 
-        s = torch.as_tensor(s, dtype=torch.float32)
+        s = torch.as_tensor(s, dtype=torch.float32, device=self.device)
         self.policy.eval()
         ev = self.evaluate(s)
         return metrics(ev, loss=self.loss(ev).item(), lam=self.lam,

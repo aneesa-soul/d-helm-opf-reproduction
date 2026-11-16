@@ -350,7 +350,8 @@ Choices where the paper names something without a number, or is unreadable:
 * The norm in the feasibility test ‖ηZ‖ ≤ 10⁻⁴ (Euclidean), and R1 acting on the actions (Remark 5) rather than the policy weights (Sec. 4.4).
 * Policy input "+4" = the previous p_g of G_ns (Table 1 symbol unreadable).
 * η_n = 1/(x̄ − x̲), w_r = 1/f_max, η_λ = 1, λ_max = 1,000 (Section 7–8).
-* Wind farms: 5-bus buses 1 and 4 (2 × 100 MW); 30-bus buses 6, 7, 11, 20 (4 × 9.46 MW). Same rule for both: load buses, total rating 20% of nominal load (Section 12).
+* Wind farms: 5-bus buses 1 and 4 (2 × 100 MW); 30-bus buses 6, 7, 11, 20 (4 × 9.46 MW); 118-bus seven, 300-bus ten largest-load PQ buses. Same rule for all: load buses, total rating 20% of nominal load (Sections 12-13).
+* Policy input for 118/300-bus: Table 1's +54 / +69 followed literally (previous slack output added, normalized and clipped to [-1, 1]); 5/30-bus use the non-slack outputs only, as their Table 1 columns give.
 * Action order inside the p_g and |v| blocks: by bus, `gen` before `sgen`.
 
 Matching the OPF reference to the paper's problem (not a change to the method): unrated lines unconstrained, slack voltage free, sequential OPF with the same ramp windows.
@@ -469,7 +470,44 @@ Findings:
 
 Time per state on the user's machine (shared with other jobs): policy 0.2 ms, + R1 1.6 ms, + R2 3 ms (K = 5) to 108 ms (K = 200).
 
-### 13. Remaining work
+### 13. IEEE 118- and 300-bus systems
+
+**Status: 118-bus implemented and validated, runs pending. 300-bus blocked: the paper's HELM settings do not converge on it (see below).**
+
+From the paper (Table 1, Sec. 4):
+
+| | 118-bus | 300-bus |
+|---|---|---|
+| Network | pandapower `case118` | pandapower `case300` |
+| Uncertainties | 99 × 2 + 7 = 205 | 193 × 2 + 10 = 396 |
+| Policy input | 205 + 54 | 396 + 69 |
+| Policy output (|v| + p_g) | 54 + 53 | 69 + 68 |
+| HELM output 2(|B| + |G| + |L|) | 2(118 + 54 + 173) = 690, lines only | 2(300 + 77 + 283) = 1320: the 8 fixed sgens count as units, lines only |
+| Minibatch / lr | 128 / 5 × 10⁻⁴ | 128 / 5 × 10⁻⁴ |
+| Policy layers | LSTM 128 → 128 → 128 | LSTM 256 → 256 → 256 |
+| Table 2 training | 3,000 episodes | 8,000 episodes |
+| Seeds | 5 for the Fig. 7 curves; Table 2 does not say | same |
+
+Implementation notes:
+
+* **Policy input followed row by row.** Table 1's extra inputs are +4 / +5 (|G / G_s|) for 5- / 30-bus but +54 / +69 (|G|) for 118- / 300-bus; one footnote defines both, so one pair of rows is a typo. Following the numbers, the 118/300 policies also receive the previous slack output, normalized by its static range and clipped to [-1, 1] (our choice). The 5/30-bus setup is unchanged.
+* **Slack angle.** `case118` has its slack at 30°. Without phase shifters this is only an angle reference, so the D-HELM moves it to 0° (magnitudes, powers, currents and costs unchanged).
+* **Transformers.** Only lines carry the (16d)-(16e) current limits, matching Table 1's HELM output count; transformer rows of the branch matrices are skipped.
+* **Wind (our choice, same rule as 5/30-bus):** load buses, 20% of the nominal load in total. 118-bus: the seven largest-load PQ buses (0-based 10, 44, 59, 74, 77, 81, 87), 7 × 121.2 MW. 300-bus: the ten largest-load PQ buses, 10 × 477.0 MW.
+* **GPU training.** `--device cuda` runs the D-HELM, critic and policy on the GPU (evaluation stays on the CPU). On the user's RTX 4070 one 118-bus training step (24 × batch 128) takes 2.8 s against 17.0 s on the shared CPU: about 2.3 days per seed for 3,000 episodes. Table 2 is run with 3 seeds (the paper does not state the number for Table 2).
+
+Validation (`scripts/test_case118.py`): Table 1 dimensions; critic vs pandapower on random states and actions (slack P and unit Q to 10⁻⁸, voltages and currents to 10⁻¹¹, all 465 z entries to 10⁻¹⁰); gradcheck; the previous-slack input; the sequential OPF reference; and, where CUDA is available, critic GPU = CPU and a GPU training step. 5/30-bus training is bit-identical to before these changes.
+
+**300-bus: HELM does not converge with the paper's settings.** With n_max = 30 (Table 1), plain HELM does not converge at the network's own nominal operating point (it needs 41 terms there), and for our sampled operating points it does not converge at all, even with 60 terms and with or without wind. At the starting policy the mid-range dispatch (15,140 MW) is far below the load (about 20,000 MW at 85%), leaving a large import on the single slack bus. The paper itself notes (Sec. 5.1, point 2) that "random initialization of policy parameters may cause learning divergence in large-scale power systems" and recommends imitation learning from a small set of OPF solutions, narrower uncertainty ranges, or strategies to escape divergence early in training. Which of these the authors used for their 300-bus results is not stated.
+
+Commands (118-bus):
+
+```
+python scripts/run_seeds.py --case case118 --device cuda --name c118_fig7
+python scripts/run_seeds.py --case case118 --device cuda --name c118_table2 --episodes 3000 --eval-every 200 --seeds 0 1 2
+```
+
+### 14. Remaining work
 
 * A constrained refinement using the critic's exact Jacobians (SQP or augmented Lagrangian) to remove R2's boundary crawl.
 * Training-side improvements toward the paper's 500-step claim (Section 10 shows the gap and the large seed variance), such as learning rate and network size. Since the optimum often lies at action bounds, the tanh parametrization (Eq. 18) is worth examining.
@@ -524,4 +562,4 @@ Results, over 5 seeds against the matched OPF:
 * **Improvement (R2) under the paper protocol:** +0.92% at K = 5 (1 ms per state) and +0.37% ± 0.31 at K = 200 (30 ms per state), 99.3% feasible.
 * **Extended training (Section 9, not the paper's settings):** 5,000 steps without ramping, +3.5% (R1) and +1.8% ± 0.1 (R2, K = 200).
 
-Next targets are listed in Section 13.
+Next targets are listed in Section 14.

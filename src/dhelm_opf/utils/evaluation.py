@@ -51,7 +51,8 @@ def load_agent(run_dir: str | Path, checkpoint: str = "best"):
             "support only have policy.pt; use --checkpoint last)."
         )
 
-    ckpt = torch.load(path, weights_only=False)
+    # Evaluation runs on the CPU; checkpoints trained on a GPU load too.
+    ckpt = torch.load(path, weights_only=False, map_location="cpu")
     args = ckpt["args"]
 
     # Checkpoints written before the rename to paper symbols use the
@@ -174,7 +175,7 @@ def evaluate_policy(
     if S % window:
         raise ValueError(f"{S} states cannot be split into windows of {window}.")
 
-    if agent.critic.ramping:
+    if agent.critic.ramping or agent.policy.prev_slack:
         roll = _rollout_ramped(agent, states, window, refine)
         a_hat, cost, z = roll["a_hat"], roll["cost"], roll["z"]
         t_policy, t_refine = roll["t_policy"], roll["t_refine"]
@@ -290,9 +291,10 @@ def _rollout_ramped(agent: Agent, states: np.ndarray, window: int,
     policy, critic = agent.policy, agent.critic
     P_min = torch.as_tensor(agent.action_config.P_min, dtype=torch.float64)
     P_max = torch.as_tensor(agent.action_config.P_max, dtype=torch.float64)
+    P_min_s, P_max_s = agent.action_config.G_s.P_min, agent.action_config.G_s.P_max
 
     hc = None
-    prev_in = torch.zeros(E, policy.n_g, dtype=policy.state_low.dtype)
+    prev_in = torch.zeros(E, policy.n_prev, dtype=policy.state_low.dtype)
     p_g_prev = p_g_s_prev = None
 
     a_hat, cost, z, p_g, p_g_s = [], [], [], [], []
@@ -327,6 +329,9 @@ def _rollout_ramped(agent: Agent, states: np.ndarray, window: int,
 
         p_g_prev, p_g_s_prev = pg_t.detach(), pgs_t.detach()
         prev_in = (2.0 * (p_g_prev - P_min) / (P_max - P_min) - 1.0).to(prev_in.dtype)
+        if policy.prev_slack:
+            prev_s = (2.0 * (p_g_s_prev - P_min_s) / (P_max_s - P_min_s) - 1.0).clamp(-1.0, 1.0)
+            prev_in = torch.cat([prev_in, prev_s.to(prev_in.dtype).unsqueeze(1)], dim=1)
 
     def flat(xs):
         x = torch.stack(xs, dim=1)              # (E, L, ...) -> order (e, t)

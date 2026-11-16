@@ -87,7 +87,9 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--name", required=True)
     p.add_argument("--case", default="case5",
-                   help="test system (case5, case30)")
+                   help="test system (case5, case30, case118, case300)")
+    p.add_argument("--device", default="cpu",
+                   help="training device (cpu or cuda); evaluation runs on the CPU")
     p.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     p.add_argument("--episodes", type=int, default=20)
     p.add_argument("--episode-length", type=int, default=24)
@@ -134,6 +136,7 @@ def main() -> None:
             sys.executable, str(TRAIN_SCRIPT),
             "--episodes", str(args.episodes),
             "--case", args.case,
+            "--device", args.device,
             "--episode-length", str(args.episode_length),
             "--window", str(args.window),
             "--eval-every", str(args.eval_every),

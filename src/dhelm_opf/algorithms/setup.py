@@ -54,6 +54,7 @@ def make_agent(
     hidden: int | None = None,
     p_first: bool = True,
     ramp: RampConfig | None = None,
+    device: str = "cpu",
 ) -> Agent:
     """
     case:    name in environment/cases.py or a CaseSpec.
@@ -61,6 +62,7 @@ def make_agent(
     p_first: action order of Eq. (4) (p_g first).  False reproduces the
              voltage-first layout of runs made before that change.
     ramp:    Eq. (3) ramp limits; None disables ramping.
+    device:  "cpu" or "cuda" for the D-HELM, critic and policy.
 
     cpo_config defaults to the case's Table 1 minibatch and lr.
     """
@@ -76,7 +78,7 @@ def make_agent(
     uncertainty = uncertainty_for(spec)
 
     dhelm = DHelmNetwork(net, action_config, uncertainty, solver_config,
-                         ramp=ramp)
+                         device=device, ramp=ramp)
     critic = DHELMCritic(dhelm, net, critic_config)
 
     sampler = StateSampler(dhelm.n_d, dhelm.n_w, uncertainty, seed=seed)
@@ -89,7 +91,8 @@ def make_agent(
         state_high=sampler.high,
         hidden=hidden or spec.hidden,
         idx_p=action_config.generator_action_indices,
-    )
+        prev_slack=spec.prev_slack,
+    ).to(device)
 
     cpo = DHelmCPO(policy, critic, cpo_config)
 
