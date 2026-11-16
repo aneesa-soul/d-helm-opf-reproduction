@@ -416,7 +416,7 @@ Findings:
 
 ### 12. IEEE 30-bus system
 
-**Status: Implemented and validated; training runs pending.**
+**Status: Implemented, validated and run over 5 seeds (20 and 2,000 episodes).**
 
 The code now builds the agent for any test system in `environment/cases.py` (`algorithms/setup.py`, `make_agent(case)`); `--case case30` selects the 30-bus system in the training and evaluation scripts. The 5-bus results are unchanged (regression check bit-identical).
 
@@ -446,7 +446,28 @@ python scripts/run_seeds.py --case case30 --name c30_fig6
 python scripts/run_seeds.py --case case30 --name c30_table2 --episodes 2000 --eval-every 100
 ```
 
-Results: pending.
+Results, 5 seeds, mean ± std over seeds, 2,400 test states (100 profiles × 24), against the matched sequential OPF with the slack voltage free (2,390/2,400 steps solved, mean 372.2 $/h; 90 of the 100 profiles fully solved). Runs made on the user's machine (2026-11-06 to 11-16).
+
+| Variant | 20 episodes (480 steps, Fig. 6) | | 2,000 episodes (Table 2 agents) | |
+|---|---|---|---|---|
+| | Gap vs OPF | Feasible | Gap vs OPF | Feasible |
+| trained policy (last) | +1.58% ± 0.72 | 94.8% ± 1.4 | **+0.01% ± 0.00** | **99.0% ± 0.2** |
+| + R1, K = 3 (paper, Remark 5) | +1.59% ± 0.68 | 98.1% ± 0.4 | +0.01% | 99.2% ± 0.1 |
+| + R2, K = 5 | +0.32% ± 0.07 | 97.9% | +0.01% | 99.2% |
+| + R2, K = 200 | +0.03% ± 0.00 | 99.5% | +0.01% | 99.6% |
+| best checkpoint (reference) | +1.63% ± 0.75 | 94.9% | +0.01% | 98.9% |
+
+Paper, Table 3 (30-bus, 1,000 profiles × 24, against the PP solver): learned +3.1% at 99.91% feasible; enhanced +0.6% at 100%.
+
+Findings:
+
+* **After 2,000 episodes the policy matches the OPF cost** (+0.01%, all five seeds) at 99.0% feasibility; R1 raises it to 99.2%, R2 at K = 200 to 99.6%. Per profile the reward is 40.69 against the OPF's 40.70.
+* **After 20 episodes the cost is already within +1.6%**, consistent with the paper's Fig. 6 ("2 episodes to converge to a suitable zone"); feasibility is still 95% and rises with longer training, as the paper describes (about 300 episodes to remove violations).
+* **Remaining infeasible states:** about 1% after training, 0.4–0.8% after refinement, against the paper's 99.91% (learned) and 100% (enhanced). Part of this is states with no feasible point under the ramp limits: 10 of 2,400 test steps (0.4%) have no OPF solution either.
+* **Our gap is smaller than the paper's (+0.01% against +3.1%), but the problems differ.** Our 30-bus OPF costs 8,931 $ per 24-sample profile against the paper's 13,310 $, so our system is more lightly loaded (uniform 60–110% loads plus 20% wind, Section 12 calibration note). Fewer binding limits make the optimum easier to reach. This is not evidence that the reproduction beats the paper; the comparable statement is that the learned policy is near-optimal and about 99% feasible on both systems.
+* **R2 adds little after full training** (the policy is already at the optimum); its value is in short training (20 episodes: +1.6% → +0.3% at K = 5, under 1 ms per state).
+
+Time per state on the user's machine (shared with other jobs): policy 0.2 ms, + R1 1.6 ms, + R2 3 ms (K = 5) to 108 ms (K = 200).
 
 ### 13. Remaining work
 
