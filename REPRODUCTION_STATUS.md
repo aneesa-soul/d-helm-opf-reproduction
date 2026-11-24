@@ -533,7 +533,39 @@ Findings:
 * **Last vs best checkpoint:** the best checkpoint (+0.38%) is closer to the paper's enhanced value than the last iterate; the reported reproduction result is the last iterate, as everywhere else.
 * **Lighter loading than the paper again:** our OPF costs 2.00 × 10⁶ $ per 24-sample profile against the paper's 2.88 × 10⁶ $ (as for 5- and 30-bus), so absolute costs are not comparable; gaps and feasibility are.
 
-### 14. Remaining work
+### 14. Baseline agents: DDPG, SAC, PPO (MBPO pending)
+
+**Status: Implemented and tested; runs pending.**
+
+From the paper (Sec. 4.1-4.2):
+
+* **Algorithms:** DDPG, PPO, SAC ("improved": entropy maximization, auto-tuned temperature, two critics and two target critics, prioritized replay) and MBPO (the method of the authors' 2024 paper [23]: an HELM-based environment with SAC). MBPO is a separate step.
+* **Software:** a gymnasium environment with HELM power flow; agents from Tianshou. We use **Tianshou 0.5.1** (2023), the last release for Python 3.10 and the one matching the paper's time frame (`pip install -e .[baselines]`).
+* **Actors:** "The policy network of all test cases is designed as in Table 1": the same LSTM(h) → h → h (SELU) network as the proposed method. SAC's sigma comes from "an additional network with the same structure as the actor"; PPO uses Tianshou's state-independent learnable sigma (not stated in the paper).
+* **Critics:** two Q networks on (state, action), ReLU, hidden 64/64 (5-bus), 128/64 (30-bus), 256/256/128 (118-bus; printed "256/265/128"), 512/128/128 (300-bus); PPO's V network uses the same sizes. Learning rate 10⁻⁴, target smoothing τ = 10⁻³; minibatch per Table 1.
+* **Training / evaluation:** 1,000 / 2,000 / 3,000 episodes; Fig. 7 curves over 5 seeds; deterministic evaluation ("disabling random noise in DDPG and using the mean value of action distributions") on 100 profiles × 24.
+
+Implementation (`src/dhelm_opf/baselines/`, `scripts/train_baseline.py`, `scripts/run_baselines.py`):
+
+* **Environment** (`baselines/env.py`): one episode = one 24-step profile with the Eq. (3) ramp limits; the observation is the Table 1 policy input (normalized state + previous dispatch, plus the previous slack output for 118/300-bus); the power flow, cost and violations come from the same validated critic the proposed method uses (no gradients). Observation / action sizes equal Table 1 (12/8, 49/11, 259/107).
+* **Reward (our choice):** Eq. (5) − ρ Σz with a fixed ρ = 10 (= λ⁽⁰⁾). The paper gives no penalty weight, and notes that adaptive penalties make the replay buffer unstable for off-policy agents.
+* **Recurrence:** Tianshou's convention. While collecting, the actor steps one observation and carries its LSTM state; in training it receives stacked windows of the episode so far (stack_num = 24, padded with the episode's first observation).
+* **Other choices (Tianshou defaults or Tianshou's own examples):** γ = 0.99; DDPG Gaussian noise σ = 0.1; SAC target entropy −|A|, temperature lr 3 × 10⁻⁴, prioritized replay α = 0.6, β = 0.4; PPO clip 0.2, GAE λ = 0.95, value coefficient 0.5, entropy coefficient 0.01, 8 episodes per update × 10 passes; off-policy: one gradient update per environment step after 10 random warm-up episodes.
+* **Evaluation** (`baselines/evaluate.py`): the same 2,400 test states, ramp sequencing and cached OPF reference as the proposed method, so gaps and feasibility compare directly. Reported per profile: the penalized reward (Eq. 5 − 10 Σz, the quantity the agents maximize, comparable in spirit to Table 2) and the Eq. (5) reward.
+
+Validation (`scripts/test_baselines.py`): gymnasium env checker; Table 1 sizes; reward and ramp window against the critic; network sizes; recurrent shapes while collecting and training; batched evaluation = stepping the environment.
+
+Cost on a 2-core CPU, per training episode: 30-bus 0.6 / 0.9 / 0.2 s (DDPG / SAC / PPO), 118-bus 2.1 / 3.5 / 0.75 s. At the paper's lengths one seed of all three takes about 25 min (5-bus), 1 h (30-bus) and 5 h (118-bus), so 5 seeds are used throughout.
+
+Commands:
+
+```
+python scripts/run_baselines.py --case case5   --name bl_case5
+python scripts/run_baselines.py --case case30  --name bl_case30
+python scripts/run_baselines.py --case case118 --name bl_case118
+```
+
+### 15. Remaining work
 
 * A constrained refinement using the critic's exact Jacobians (SQP or augmented Lagrangian) to remove R2's boundary crawl.
 * Training-side improvements toward the paper's 500-step claim (Section 10 shows the gap and the large seed variance), such as learning rate and network size. Since the optimum often lies at action bounds, the tanh parametrization (Eq. 18) is worth examining.
@@ -588,4 +620,4 @@ Results, over 5 seeds against the matched OPF:
 * **Improvement (R2) under the paper protocol:** +0.92% at K = 5 (1 ms per state) and +0.37% ± 0.31 at K = 200 (30 ms per state), 99.3% feasible.
 * **Extended training (Section 9, not the paper's settings):** 5,000 steps without ramping, +3.5% (R1) and +1.8% ± 0.1 (R2, K = 200).
 
-Next targets are listed in Section 14.
+Next targets are listed in Section 15.

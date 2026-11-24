@@ -16,5 +16,13 @@ dependencies = [
     "matplotlib",
 ]
 
+[project.optional-dependencies]
+# Baseline agents (paper Sec. 4.1: Tianshou + gymnasium).  0.5.1 is the
+# last Tianshou release for Python 3.10 (1.x needs >= 3.11).
+baselines = [
+    "tianshou==0.5.1",
+    "gymnasium>=0.28",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
