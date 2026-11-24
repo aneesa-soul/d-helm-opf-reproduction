@@ -472,7 +472,7 @@ Time per state on the user's machine (shared with other jobs): policy 0.2 ms, + 
 
 ### 13. IEEE 118- and 300-bus systems
 
-**Status: 118-bus implemented and validated, runs pending. 300-bus blocked: the paper's HELM settings do not converge on it (see below).**
+**Status: 118-bus implemented, validated and run (5 seeds × 20 episodes, 3 seeds × 3,000 episodes, GPU). 300-bus blocked: the paper's HELM settings do not converge on it (see below).**
 
 From the paper (Table 1, Sec. 4):
 
@@ -506,6 +506,32 @@ Commands (118-bus):
 python scripts/run_seeds.py --case case118 --device cuda --name c118_fig7
 python scripts/run_seeds.py --case case118 --device cuda --name c118_table2 --episodes 3000 --eval-every 200 --seeds 0 1 2
 ```
+
+The Table 2 seeds were trained in parallel on the GPU (`train_dhelm_case5.py --case case118 --device cuda --episodes 3000 --eval-every 200`), about 40 h each with three runs sharing the RTX 4070; evaluation ran on the CPU.
+
+**118-bus results** (2,400 test states = 100 profiles × 24, against the matched sequential OPF with the slack voltage free: 2,400/2,400 solved, mean 83,413 $/h; mean ± std over seeds):
+
+| Variant | 20 episodes (5 seeds) | | 3,000 episodes (3 seeds, Table 2 agents) | |
+|---|---|---|---|---|
+| | Gap vs OPF | Feasible | Gap vs OPF | Feasible |
+| trained policy (last) | +26.0% ± 2.8 | 35.3% | **+1.40% ± 1.20** | **99.9% ± 0.1** |
+| + R1, K = 3 (paper, Remark 5) | +25.6% | 37.7% | +1.40% | 99.9% |
+| + R2, K = 5 | +25.3% | 41.5% | +1.38% | 99.9% |
+| + R2, K = 50 | +22.9% | 100% | +1.22% | 100% |
+| + R2, K = 200 | +19.8% ± 1.5 | 100% | +1.12% ± 0.71 | 100% |
+| best checkpoint (reference) | +26.0% | 35.4% | +0.38% ± 0.07 | 100% |
+
+Per seed after 3,000 episodes (last): +0.82%, +0.59%, +2.77%; seed 2's final iterate is above its own best checkpoint (+0.33%), a late fluctuation of the constant-learning-rate training.
+
+Paper, Table 3 (118-bus, 1,000 profiles × 24, against the PP solver): PP 2.882 × 10⁶ $/day at 100%; learned 2.904 × 10⁶ $ (+0.8%) at 99.12%; enhanced 2.891 × 10⁶ $ (+0.3%) at 100%.
+
+Findings:
+
+* **The 118-bus reproduction matches the paper.** After 3,000 episodes the learned policy is +1.4% above the OPF (+0.6% and +0.8% for two of the three seeds) at 99.9% feasibility, against the paper's +0.8% at 99.12%.
+* **20 episodes are far from enough on 118-bus** (+26%, 35% feasible); with 107 actions and 465 constraints the policy needs most of the 3,000 episodes.
+* **Refinement:** R1 (3 steps) and R2 at small K change little once the policy is trained; R2 at K ≥ 20 reaches 100% feasibility, matching the paper's enhanced column, while the cost gap stays about +1.1-1.2%. After 20 episodes R2 at K = 50 already gives 100% feasibility, but cannot fix a +23% cost gap.
+* **Last vs best checkpoint:** the best checkpoint (+0.38%) is closer to the paper's enhanced value than the last iterate; the reported reproduction result is the last iterate, as everywhere else.
+* **Lighter loading than the paper again:** our OPF costs 2.00 × 10⁶ $ per 24-sample profile against the paper's 2.88 × 10⁶ $ (as for 5- and 30-bus), so absolute costs are not comparable; gaps and feasibility are.
 
 ### 14. Remaining work
 
