@@ -14,7 +14,9 @@ Tianshou's own examples:
   alpha = 0.6, beta = 0.4;
 * PPO: clip 0.2, GAE lambda 0.95, value coefficient 0.5, entropy
   coefficient 0.01, advantage normalization; 8 episodes per update,
-  10 passes;
+  10 passes; reward normalization and gradient-norm clipping at 0.5
+  (both from Tianshou's PPO examples); tanh-bounded mean (Tianshou's
+  ActorProb default; see nets.py);
 * off-policy: one gradient update per environment step after 10 random
   warm-up episodes; replay buffer holding all transitions;
 * recurrent training windows: stack_num = 24 (the whole episode, as for
@@ -106,13 +108,14 @@ def build(algo: str, case: str, obs_dim: int, act_dim: int, action_space,
 
     elif algo == "ppo":
         actor = GaussianActor(obs_dim, act_dim, h, conditioned_sigma=False,
-                              device=device).to(device)
+                              device=device, bounded_mean=True).to(device)
         critic = VCritic(obs_dim, sizes, device).to(device)
         params = list(actor.parameters()) + list(critic.parameters())
         policy = PPOPolicy(
             actor, critic, torch.optim.Adam(params, lr=cfg.lr), dist_fn,
             discount_factor=cfg.gamma, eps_clip=0.2, gae_lambda=0.95,
             vf_coef=0.5, ent_coef=0.01, advantage_normalization=True,
+            reward_normalization=True, max_grad_norm=0.5,
             deterministic_eval=True,
             action_space=action_space, action_scaling=False,
             action_bound_method="clip",

@@ -12,7 +12,12 @@ as the proposed method, h = 64 / 64 / 128 / 256.
       the actor is employed to predict sigma values" -> a second Table 1
       network for log sigma.
     - PPO: the paper does not say; a state-independent learnable log
-      sigma (Tianshou's default for PPO) is used.
+      sigma (Tianshou's default for PPO) is used, and the mean is bounded
+      with tanh (Tianshou's ActorProb default, unbounded=False).  With an
+      unbounded mean PPO pushed it far outside the clipped action range
+      (|mu| ~ 8 within 80 updates) until the probability ratios
+      overflowed to NaN.  SAC keeps an unbounded mean: it squashes the
+      sampled action with tanh itself.
 
 Critics: "The Q function is approximated by two critic networks, which
 accept the actions and states" with hidden sizes 64/64, 128/64,
@@ -86,9 +91,11 @@ class DeterministicActor(nn.Module):
 class GaussianActor(nn.Module):
     """(mu, sigma) for Tianshou's SAC / PPO policies."""
 
-    def __init__(self, obs_dim, act_dim, hidden, conditioned_sigma, device="cpu") -> None:
+    def __init__(self, obs_dim, act_dim, hidden, conditioned_sigma, device="cpu",
+                 bounded_mean=False) -> None:
         super().__init__()
         self.mu = TableOneNet(obs_dim, act_dim, hidden)
+        self.bounded_mean = bounded_mean
         self.conditioned_sigma = conditioned_sigma
         if conditioned_sigma:
             self.sigma = TableOneNet(obs_dim, act_dim, hidden)
@@ -99,6 +106,8 @@ class GaussianActor(nn.Module):
     def forward(self, obs, state=None, info={}):
         obs = _as_tensor(obs, self.device)
         mu, h_mu = self.mu(obs, _split(state, "mu"))
+        if self.bounded_mean:
+            mu = torch.tanh(mu)
         if self.conditioned_sigma:
             log_sigma, h_sig = self.sigma(obs, _split(state, "sigma"))
         else:

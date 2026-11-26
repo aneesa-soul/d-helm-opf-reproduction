@@ -57,6 +57,13 @@ def last_episode_stats(buffer, n_steps):
     }
 
 
+def check_finite(policy, name) -> None:
+    """Stop with a clear message instead of training on NaN weights."""
+    for k, v in policy.state_dict().items():
+        if torch.is_tensor(v) and v.is_floating_point() and not torch.isfinite(v).all():
+            raise FloatingPointError(f"{name}: non-finite weights in {k}")
+
+
 def main(argv=None) -> None:
     args = parse_args(argv)
     name = args.name or f"{args.case}_{args.algo}_seed{args.seed}"
@@ -87,6 +94,8 @@ def main(argv=None) -> None:
             collector.collect(n_episode=1)
             for _ in range(L):                         # one update per step
                 policy.update(batch, buffer)
+            if ep % 10 == 0:
+                check_finite(policy, name)
             rows.append({"episode": ep, **last_episode_stats(buffer, L)})
             if not args.quiet and ep % 50 == 0:
                 print(f"  ep {ep:5d}  return {rows[-1]['return']:9.2f}  "
@@ -108,6 +117,7 @@ def main(argv=None) -> None:
                              "r_eq5": float(np.sum(b.info.r_eq5))})
             policy.update(0, buffer, batch_size=batch, repeat=cfg.ppo_repeat)
             buffer.reset()
+            check_finite(policy, name)
             if not args.quiet and ep % 48 < n:
                 print(f"  ep {ep:5d}  return {rows[-1]['return']:9.2f}  "
                       f"cost {rows[-1]['f_sum']:10.1f}  feasible {rows[-1]['feasible']:.2f}")
