@@ -16,7 +16,8 @@ Tianshou's own examples:
   coefficient 0.01, advantage normalization; 8 episodes per update,
   10 passes; reward normalization and gradient-norm clipping at 0.5
   (both from Tianshou's PPO examples); tanh-bounded mean (Tianshou's
-  ActorProb default; see nets.py);
+  ActorProb default; see nets.py); log probability ratio clamped to
+  +-20 before exp() (StablePPOPolicy, against float32 overflow);
 * off-policy: one gradient update per environment step after 10 random
   warm-up episodes; replay buffer holding all transitions;
 * recurrent training windows: stack_num = 24 (the whole episode, as for
@@ -29,6 +30,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from torch import nn
 from tianshou.data import PrioritizedVectorReplayBuffer, VectorReplayBuffer
 from tianshou.exploration import GaussianNoise
 from tianshou.policy import DDPGPolicy, PPOPolicy, SACPolicy
@@ -63,6 +65,57 @@ class BaselineConfig:
 
 def dist_fn(*logits):
     return Independent(Normal(*logits), 1)
+
+
+LOG_RATIO_MAX = 20.0
+
+
+class StablePPOPolicy(PPOPolicy):
+    """Tianshou 0.5.1 PPOPolicy.learn with one change: the log probability
+    ratio is clamped to +-LOG_RATIO_MAX before exp().
+
+    Within a single update the 11-dimensional (30-bus) policy sometimes
+    moved so far that log(pi_new / pi_old) reached 45-82; exp() of that
+    gave a clip loss of ~5e17, an infinite gradient norm, and (past ~88,
+    float32 overflow) NaN weights.  exp(20) ~ 5e8 is still far outside the
+    clip range [0.8, 1.2], so normal updates are unchanged; only the
+    overflow is removed.  Our departure from Tianshou, not in the paper.
+    """
+
+    def learn(self, batch, batch_size, repeat, **kwargs):
+        losses, clip_losses, vf_losses, ent_losses = [], [], [], []
+        for step in range(repeat):
+            if self._recompute_adv and step > 0:
+                batch = self._compute_returns(batch, self._buffer, self._indices)
+            for minibatch in batch.split(batch_size, merge_last=True):
+                dist = self(minibatch).dist
+                if self._norm_adv:
+                    mean, std = minibatch.adv.mean(), minibatch.adv.std()
+                    minibatch.adv = (minibatch.adv - mean) / (std + self._eps)
+                log_ratio = dist.log_prob(minibatch.act) - minibatch.logp_old
+                ratio = log_ratio.clamp(-LOG_RATIO_MAX, LOG_RATIO_MAX).exp().float()
+                ratio = ratio.reshape(ratio.size(0), -1).transpose(0, 1)
+                surr1 = ratio * minibatch.adv
+                surr2 = ratio.clamp(1.0 - self._eps_clip,
+                                    1.0 + self._eps_clip) * minibatch.adv
+                clip_loss = -torch.min(surr1, surr2).mean()
+                value = self.critic(minibatch.obs).flatten()
+                vf_loss = (minibatch.returns - value).pow(2).mean()
+                ent_loss = dist.entropy().mean()
+                loss = clip_loss + self._weight_vf * vf_loss \
+                    - self._weight_ent * ent_loss
+                self.optim.zero_grad()
+                loss.backward()
+                if self._grad_norm:
+                    nn.utils.clip_grad_norm_(self._actor_critic.parameters(),
+                                             max_norm=self._grad_norm)
+                self.optim.step()
+                clip_losses.append(clip_loss.item())
+                vf_losses.append(vf_loss.item())
+                ent_losses.append(ent_loss.item())
+                losses.append(loss.item())
+        return {"loss": losses, "loss/clip": clip_losses,
+                "loss/vf": vf_losses, "loss/ent": ent_losses}
 
 
 def build(algo: str, case: str, obs_dim: int, act_dim: int, action_space,
@@ -111,7 +164,7 @@ def build(algo: str, case: str, obs_dim: int, act_dim: int, action_space,
                               device=device, bounded_mean=True).to(device)
         critic = VCritic(obs_dim, sizes, device).to(device)
         params = list(actor.parameters()) + list(critic.parameters())
-        policy = PPOPolicy(
+        policy = StablePPOPolicy(
             actor, critic, torch.optim.Adam(params, lr=cfg.lr), dist_fn,
             discount_factor=cfg.gamma, eps_clip=0.2, gae_lambda=0.95,
             vf_coef=0.5, ent_coef=0.01, advantage_normalization=True,

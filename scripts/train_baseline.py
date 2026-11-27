@@ -44,17 +44,27 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def last_episode_stats(buffer, n_steps):
-    """Return, cost, violation and feasible share of the last n_steps."""
-    idx = (buffer.last_index[0] - np.arange(n_steps)[::-1]) % buffer.maxsize
-    b = buffer[idx]
+def episode_stats(buffer, idx):
+    """Return, cost, violation and feasible share of the steps idx.
+
+    Read from buffer.rew / buffer.info directly: buffer[idx] stacks
+    `info` into stack_num-long windows padded with the episode's first
+    step (like the observations), which biased these averages toward
+    step 0 (and made the r_eq5 sum ~24x too large) before this fix.
+    """
+    info = buffer.info
     return {
-        "return": float(np.sum(b.rew)),
-        "f_sum": float(np.mean(b.info.f_sum)),
-        "z_sum": float(np.mean(b.info.z_sum)),
-        "feasible": float(np.mean(b.info.feasible)),
-        "r_eq5": float(np.sum(b.info.r_eq5)),
+        "return": float(np.sum(buffer.rew[idx])),
+        "f_sum": float(np.mean(info.f_sum[idx])),
+        "z_sum": float(np.mean(info.z_sum[idx])),
+        "feasible": float(np.mean(info.feasible[idx])),
+        "r_eq5": float(np.sum(info.r_eq5[idx])),
     }
+
+
+def last_episode_stats(buffer, n_steps):
+    idx = (buffer.last_index[0] - np.arange(n_steps)[::-1]) % buffer.maxsize
+    return episode_stats(buffer, idx)
 
 
 def check_finite(policy, name) -> None:
@@ -108,13 +118,8 @@ def main(argv=None) -> None:
             collector.collect(n_episode=n)
             for k in range(n):
                 idx = np.arange(k * L, (k + 1) * L)
-                b = buffer[idx]
                 ep += 1
-                rows.append({"episode": ep, "return": float(np.sum(b.rew)),
-                             "f_sum": float(np.mean(b.info.f_sum)),
-                             "z_sum": float(np.mean(b.info.z_sum)),
-                             "feasible": float(np.mean(b.info.feasible)),
-                             "r_eq5": float(np.sum(b.info.r_eq5))})
+                rows.append({"episode": ep, **episode_stats(buffer, idx)})
             policy.update(0, buffer, batch_size=batch, repeat=cfg.ppo_repeat)
             buffer.reset()
             check_finite(policy, name)

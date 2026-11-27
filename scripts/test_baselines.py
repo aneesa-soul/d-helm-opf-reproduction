@@ -18,6 +18,8 @@ Run:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import torch
 from gymnasium.utils.env_checker import check_env
@@ -141,6 +143,45 @@ def test_eval_matches_env() -> None:
     print("  5. batched evaluation = env rollout  : OK (3 profiles, deterministic SAC)")
 
 
+def test_training_logs_and_ppo_clamp() -> None:
+    """Logged episode stats use the 24 real steps (no padded windows);
+    the PPO log-ratio clamp keeps a huge policy jump finite."""
+    import importlib.util
+    from dhelm_opf.baselines.agents import BaselineConfig, LOG_RATIO_MAX, build
+
+    spec = importlib.util.spec_from_file_location(
+        "train_baseline", Path(__file__).with_name("train_baseline.py"))
+    tb = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tb)
+
+    env = OPFEnv("case5", seed=0)
+    pol, buf, bs = build("ppo", "case5", env.obs_dim, env.action_space.shape[0],
+                         env.action_space, 48, BaselineConfig())
+    costs = []
+    orig = env.step
+
+    def step(a):
+        out = orig(a)
+        costs.append(out[4]["f_sum"])
+        return out
+    env.step = step
+    Collector(pol, DummyVectorEnv([lambda: env]), buf).collect(n_episode=1)
+    stats = tb.episode_stats(buf, np.arange(24))
+    assert abs(stats["f_sum"] - np.mean(costs)) < 1e-9 * np.mean(costs)
+    assert buf[np.arange(24)].info.f_sum.shape[-1] == 24   # stacked: why the fix
+    print("  6. training log = mean of 24 real steps : OK")
+
+    # PPO: make log(pi_new / pi_old) = ~1000 (exp() overflows in float32)
+    batch, idx = buf.sample(0)
+    batch = pol.process_fn(batch, buf, idx)
+    batch.logp_old = batch.logp_old - 1000.0
+    pol.learn(batch, batch_size=bs, repeat=1)
+    for v in pol.state_dict().values():
+        assert torch.isfinite(v).all()
+    assert LOG_RATIO_MAX == 20.0
+    print("  7. PPO update with a huge ratio stays finite : OK")
+
+
 def main() -> None:
     torch.manual_seed(0)
     print("Baseline tests")
@@ -149,6 +190,7 @@ def main() -> None:
     test_networks()
     test_recurrence()
     test_eval_matches_env()
+    test_training_logs_and_ppo_clamp()
     print("All baseline tests passed.")
 
 
